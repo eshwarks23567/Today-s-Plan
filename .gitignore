@@ -1,3 +1,5 @@
 backend/cache/
 __pycache__/
 *.pyc
+FEATURES.md
+PRD.md
