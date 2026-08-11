@@ -3,7 +3,7 @@ if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catc
 const $ = (id) => document.getElementById(id);
 const chat = $("chat"), q = $("q"), form = $("form"), micBtn = $("mic"),
       speakBtn = $("speak"), citySel = $("city"), sendBtn = $("send"),
-      chatsSel = $("chats");
+      chatsBtn = $("chatsBtn"), chatsPanel = $("chatsPanel");
 const motionOK = !matchMedia("(prefers-reduced-motion: reduce)").matches;
 // spoken replies are opt-in (screen readers + public phones must not get surprise audio)
 let history = [], speakOn = localStorage.getItem("booktic.speak") === "1", busy = false;
@@ -43,11 +43,77 @@ function record(cls, text, asHtml) {
   save();
 }
 
+// A <select> can't hold a per-row delete button — <option> takes text and nothing
+// else — so this is a plain disclosure panel of ordinary buttons. Two real buttons
+// per row means Tab, Enter and screen readers work with no ARIA pattern to fake;
+// the arrow keys below are the only thing the native control gave away.
+const TRASH_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+  'stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6"/>' +
+  '<path d="M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>';
+
 function refreshChatsMenu() {
-  chatsSel.hidden = !store.length;
-  chatsSel.innerHTML = '<option value="">Past chats…</option>' +
-    store.map(c => `<option value="${c.id}">${c.title.replace(/</g, "&lt;")}</option>`).join("");
-  chatsSel.value = chatId ? String(chatId) : "";
+  chatsBtn.hidden = !store.length;
+  if (!store.length) return closeChats();
+  chatsPanel.innerHTML = "";
+  for (const c of store) {
+    const row = document.createElement("div");
+    row.className = "chatrow" + (String(c.id) === String(chatId) ? " current" : "");
+
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "chatopen";
+    open.textContent = c.title;  // textContent, so a title can never be markup
+    if (String(c.id) === String(chatId)) open.setAttribute("aria-current", "true");
+    open.onclick = () => { closeChats(); loadChat(c); };
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "chatdel";
+    del.title = "Delete chat";
+    del.setAttribute("aria-label", `Delete chat: ${c.title}`);
+    del.innerHTML = TRASH_SVG;
+    del.onclick = () => deleteChat(c.id);
+
+    row.append(open, del);
+    chatsPanel.appendChild(row);
+  }
+}
+
+function focusRow(i) {
+  const rows = chatsPanel.querySelectorAll(".chatrow");
+  if (!rows.length) return;
+  rows[((i % rows.length) + rows.length) % rows.length].querySelector(".chatopen").focus();
+}
+
+function openChats() {
+  chatsPanel.hidden = false;
+  chatsBtn.setAttribute("aria-expanded", "true");
+  focusRow(0);
+}
+
+function closeChats(returnFocus) {
+  if (chatsPanel.hidden) return;
+  chatsPanel.hidden = true;
+  chatsBtn.setAttribute("aria-expanded", "false");
+  if (returnFocus) chatsBtn.focus();
+}
+
+// No confirmation step: this is one person's own chat list, and a prompt on every
+// delete costs more than the rare mis-tap it prevents.
+function deleteChat(id) {
+  const i = store.findIndex(c => c.id === id);
+  if (i < 0) return;
+  store.splice(i, 1);
+  localStorage.setItem("booktic.chats", JSON.stringify(store));
+  if (String(id) === String(chatId)) {
+    // deleting the conversation on screen has to clear the screen too, or the
+    // messages sit there with nothing backing them
+    closeChats();
+    return freshChat();
+  }
+  refreshChatsMenu();
+  if (!store.length) return closeChats(true);
+  focusRow(Math.min(i, store.length - 1));  // keep the keyboard where the row was
 }
 
 function bindChips() {
@@ -86,10 +152,31 @@ function loadChat(rec) {
 }
 
 $("newchat").onclick = freshChat;
-chatsSel.onchange = () => {
-  const rec = store.find(c => String(c.id) === chatsSel.value);
-  if (rec) loadChat(rec);
+$("home").onclick = freshChat;  // the wordmark is a real <button>, so this is keyboard-reachable
+
+chatsBtn.onclick = () => (chatsPanel.hidden ? openChats() : closeChats(true));
+chatsBtn.onkeydown = (e) => {
+  if (e.key === "ArrowDown") { e.preventDefault(); openChats(); }
 };
+
+chatsPanel.onkeydown = (e) => {
+  const rows = [...chatsPanel.querySelectorAll(".chatrow")];
+  const cur = rows.indexOf(document.activeElement.closest(".chatrow"));
+  if (e.key === "Escape") {
+    e.preventDefault();
+    e.stopPropagation();  // don't also trigger the global Esc (stop speech / abort)
+    closeChats(true);
+  } else if (e.key === "ArrowDown") { e.preventDefault(); focusRow(cur + 1); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); focusRow(cur - 1); }
+  else if (e.key === "Home") { e.preventDefault(); focusRow(0); }
+  else if (e.key === "End") { e.preventDefault(); focusRow(rows.length - 1); }
+  else if (e.key === "Delete" && cur >= 0) { e.preventDefault(); deleteChat(store[cur]?.id); }
+};
+
+// clicking away closes it; pointerdown so it beats the row's own click
+addEventListener("pointerdown", (e) => {
+  if (!chatsPanel.hidden && !e.target.closest(".chatsmenu")) closeChats();
+});
 
 // past-chats dropdown + restore of the current conversation on first page load
 (function restore() {

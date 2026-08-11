@@ -22,8 +22,15 @@
 </head>
 <body>
 <header>
-  <div class="wordmark">Today's <span>Plan</span></div>
-  <select id="chats" aria-label="Past chats" hidden></select>
+  <button type="button" class="wordmark" id="home" title="New chat">Today's <span>Plan</span></button>
+  <div class="chatsmenu">
+    <button type="button" class="chatstrigger" id="chatsBtn" hidden
+            aria-haspopup="true" aria-expanded="false" aria-controls="chatsPanel">
+      Chats
+      <svg viewBox="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg>
+    </button>
+    <div class="chatspanel" id="chatsPanel" role="group" aria-label="Past chats" hidden></div>
+  </div>
   <button type="button" class="iconbtn" id="newchat" title="New chat" aria-label="New chat">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
   </button>
