@@ -140,12 +140,19 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: " + json.dumps(event).encode() + b"\n\n")
             self.wfile.flush()
 
+        # Through a tunnel the server is not the machine the person is holding, so
+        # opening a browser here would pop a window on a desktop nobody is looking
+        # at. Any proxy header means the request came from somewhere else; then the
+        # link travels back and the page offers it as a button instead.
+        remote = any(self.headers.get(h) for h in
+                     ("CF-Ray", "CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"))
         try:
-            answer, booked = agent.handle(
+            answer, booked, url = agent.handle(
                 question, history, listings, city,
                 on_token=lambda t: send(type="token", text=t),
-                on_status=lambda t: send(type="status", text=t))
-            send(type="done", answer=answer, history=history, booked=booked,
+                on_status=lambda t: send(type="status", text=t),
+                auto_open=not remote)
+            send(type="done", answer=answer, history=history, booked=booked, url=url,
                  crawled=booktic.crawled_at(city))
         except (BrokenPipeError, ConnectionError):
             pass  # the tab was closed or Esc aborted mid-answer; nothing to report to

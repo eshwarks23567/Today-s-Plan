@@ -320,7 +320,7 @@ def test_agent_confirms_before_acting():
     real_open = agent.open_booking
     try:
         agent.open_booking = fake_open
-        answer, booked = agent._book(call, [], "hyderabad")
+        answer, booked, _ = agent._book(call, [], "hyderabad")
         check("an inferred plan asks before opening a browser", not booked and not opened)
         check("the question names the show it is about to open",
               "INOX Odeon" in answer and "07:35 PM" in answer and agent.CONFIRM_TAIL in answer)
@@ -328,8 +328,9 @@ def test_agent_confirms_before_acting():
         # the user has now said yes: our own confirmation is the last model turn
         history = [{"role": "user", "parts": [{"text": "book alpha"}]},
                    {"role": "model", "parts": [{"text": agent._confirmation(call)}]}]
-        answer, booked = agent._book(call, history, "hyderabad")
+        answer, booked, url = agent._book(call, history, "hyderabad")
         check("confirming acts instead of asking again", booked and len(opened) == 1)
+        check("the resolved link comes back for the client to open", url == "https://x/seat-layout")
 
         # a plan the user stated outright should never stall on a question
         stated = dict(call, inferred=[])
@@ -342,7 +343,7 @@ def test_agent_confirms_before_acting():
     finally:
         agent.open_booking = real_open
 
-    answer, booked = agent._book({"movie": "Alpha"}, [], "hyderabad")
+    answer, booked, _ = agent._book({"movie": "Alpha"}, [], "hyderabad")
     check("a plan with no booking URL neither asks nor acts",
           not booked and agent.CONFIRM_TAIL not in answer)
     check("an unanswered confirmation is detected in history",
