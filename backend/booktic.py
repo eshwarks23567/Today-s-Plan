@@ -14,6 +14,15 @@ from pathlib import Path
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 CACHE = Path(__file__).parent / "cache"
+# matches the <select> in frontend/index.html — also the security boundary for
+# city inputs: crawl() builds a filesystem path from this string, so anything
+# not on this list must be rejected before it ever reaches Path construction
+CITIES = {"hyderabad", "bengaluru", "mumbai", "ncr", "chennai", "pune", "kolkata"}
+
+
+def _check_city(city: str) -> None:
+    if city not in CITIES:
+        raise ValueError(f"unknown city {city!r}")
 
 
 def fetch(url: str) -> str:
@@ -49,6 +58,7 @@ _posters: dict = {}
 def posters(city: str) -> list[str]:
     """Poster images for the gallery: movies (District JSON-LD) interleaved with
     events/concerts (BMS explore page banners, recropped to portrait via CDN params)."""
+    _check_city(city)
     key = (city, date.today())
     if key not in _posters:
         dcity = DISTRICT_CITY.get(city, city)
@@ -210,18 +220,29 @@ def section(mv: dict, rows: list[dict]) -> list[str]:
 CRAWL_TTL = 20 * 60  # seconds — listings older than this refresh in the background
 DAYS = 5  # today + next 4: each extra day adds ~10 BMS page fetches per crawl
 _refreshing: set = set()
+_refresh_lock = threading.Lock()  # guards the check-and-set below against two
+                                   # requests racing to both spawn a refresh thread
 
 
 def crawl(city: str) -> str:
     """Current listings snapshot; stale-while-revalidate so answers never wait on a crawl."""
+    _check_city(city)
     CACHE.mkdir(exist_ok=True)
     cache_file = CACHE / f"{city}_{date.today():%Y%m%d}.txt"
     if not cache_file.exists():
         return _crawl_now(city, cache_file)
-    if time.time() - cache_file.stat().st_mtime > CRAWL_TTL and city not in _refreshing:
-        _refreshing.add(city)
-        threading.Thread(target=_refresh, args=(city, cache_file), daemon=True).start()
+    if time.time() - cache_file.stat().st_mtime > CRAWL_TTL:
+        with _refresh_lock:
+            if city not in _refreshing:
+                _refreshing.add(city)
+                threading.Thread(target=_refresh, args=(city, cache_file), daemon=True).start()
     return cache_file.read_text(encoding="utf-8")
+
+
+def crawled_at(city: str) -> float:
+    """Unix mtime of the snapshot answers are coming from; 0 when nothing is cached."""
+    f = CACHE / f"{city}_{date.today():%Y%m%d}.txt"
+    return f.stat().st_mtime if f.exists() else 0
 
 
 def _refresh(city: str, cache_file: Path):
@@ -282,6 +303,8 @@ def ask_llm(question: str, listings: str, history: list[dict]) -> str:
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("Set GEMINI_API_KEY (free key: https://aistudio.google.com/apikey)")
+    import prefs
+    pref_line = prefs.summary()
     system = (
         "You are BookTic, a movie-ticket assistant. Answer ONLY from the listings below - never invent "
         "movies, venues, times or prices. Prices are per-ticket in INR (Rs). When asked for cheapest, "
@@ -291,12 +314,18 @@ def ask_llm(question: str, listings: str, history: list[dict]) -> str:
         "- each date section has its own booking links, so use the link from the date the user wants. "
         "Movie showtimes cover the dates shown in the section headings; for dates beyond them, say "
         "you only see that far ahead. The events/concerts section lists upcoming events with their "
-        f"own dates. Today is {date.today().isoformat()}.\n\n{listings}"
+        f"own dates. Today is {date.today().isoformat()}."
+        + (f"\n\n{pref_line}" if pref_line else "")
+        + f"\n\n{listings}"
     )
-    history.append({"role": "user", "parts": [{"text": question}]})
+    # build the turn without mutating history yet: if the call fails, the caller
+    # retries with the SAME list, and a pre-appended question would be sent twice
+    # (Gemini then sees two consecutive user turns, and the client saves that
+    # malformed history to localStorage for good)
+    msg = {"role": "user", "parts": [{"text": question}]}
     body = json.dumps({
         "system_instruction": {"parts": [{"text": system}]},
-        "contents": history,
+        "contents": history + [msg],
     }).encode()
     out = None
     for model in ("gemini-flash-latest", "gemini-flash-lite-latest"):  # lite = separate free quota
@@ -312,7 +341,12 @@ def ask_llm(question: str, listings: str, history: list[dict]) -> str:
                 raise
     if out is None:
         raise RuntimeError("Gemini free-tier quota exhausted on both models — try again in a minute.")
-    answer = out["candidates"][0]["content"]["parts"][0]["text"]
+    candidates = out.get("candidates") or []
+    if not candidates:
+        reason = out.get("promptFeedback", {}).get("blockReason", "no response")
+        raise RuntimeError(f"Gemini returned no answer ({reason})")
+    answer = candidates[0]["content"]["parts"][0]["text"]
+    history.append(msg)
     history.append({"role": "model", "parts": [{"text": answer}]})
     return answer
 

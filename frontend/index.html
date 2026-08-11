@@ -9,12 +9,14 @@
 <meta property="og:description" content="Ask by voice or text. Today's Plan compares prices across every cinema in your city and finds the cheapest ticket in seconds.">
 <meta property="og:type" content="website">
 <meta name="theme-color" content="#0B0C0E">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23E23744'/%3E%3Ctext x='16' y='23' font-family='Arial,sans-serif' font-size='18' font-weight='700' fill='%23fff' text-anchor='middle'%3ETP%3C/text%3E%3C/svg%3E">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap">
-<link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=clash-display@500,600,700&f[]=satoshi@400,500,700&display=swap">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Today's Plan">
+<!-- fonts are served from this box: two third-party round trips on the critical
+     render path is a strange dependency for an app you reach over your own Wi-Fi -->
+<link rel="stylesheet" href="fonts.css">
 <link rel="stylesheet" href="style.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.2/anime.min.js"></script>
 </head>
@@ -56,11 +58,12 @@
 <div class="composer">
   <form id="form">
     <div class="inputwrap">
-      <input id="q" type="text" placeholder="Ask about movies, timings or prices…" autocomplete="off" autofocus aria-label="Your question">
-      <button type="button" class="iconbtn" id="mic" title="Ask by voice" aria-label="Ask by voice">
+      <input id="q" type="text" placeholder="Ask about movies, timings or prices…" autocomplete="off" autofocus
+             enterkeyhint="send" autocapitalize="sentences" aria-label="Your question">
+      <button type="button" class="iconbtn" id="mic" title="Ask by voice" aria-label="Ask by voice" aria-pressed="false">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v4"/></svg>
       </button>
-      <button type="button" class="iconbtn" id="speak" title="Read replies aloud" aria-label="Read replies aloud" aria-pressed="true">
+      <button type="button" class="iconbtn" id="speak" title="Read replies aloud" aria-label="Read replies aloud" aria-pressed="false">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg>
       </button>
     </div>
@@ -69,7 +72,7 @@
       <span class="spinner" aria-hidden="true"></span>
     </button>
   </form>
-  <p class="disclaimer">Prices come from live listings and can change at checkout. Booking completes on BookMyShow or District.</p>
+  <p class="disclaimer"><span id="fresh"></span>Prices come from live listings and can change at checkout. Booking completes on BookMyShow or District.</p>
 </div>
 
 <script src="app.js"></script>

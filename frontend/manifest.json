@@ -1,0 +1,12 @@
+{
+  "name": "Today's Plan",
+  "short_name": "Today's Plan",
+  "description": "Voice-first movie and event tickets — live prices across BookMyShow and District.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0B0C0E",
+  "theme_color": "#0B0C0E",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

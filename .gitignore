@@ -1,4 +1,5 @@
 backend/cache/
+backend/prefs.json
 __pycache__/
 *.pyc
 FEATURES.md

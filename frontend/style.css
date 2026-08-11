@@ -16,7 +16,7 @@
   /* type roles: display / body / labels */
   --font-display: "Clash Display", "Segoe UI", sans-serif;
   --font-body: "Satoshi", "Segoe UI", sans-serif;
-  --font-label: "Space Grotesk", monospace, sans-serif;
+  --font-label: "Space Grotesk", "Segoe UI", sans-serif;
 }
 * { box-sizing: border-box; margin: 0; }
 html, body { height: 100%; }
@@ -63,7 +63,6 @@ select option { background: var(--surface-2); }
   position: fixed; inset: 0; z-index: 0;
 }
 .circular-gallery:active { cursor: grabbing; }
-.circular-gallery:focus-visible { outline: 2px solid #fff; outline-offset: 4px; }
 .circular-gallery img {
   position: absolute; left: 0; top: 0;
   width: 96px; height: 138px; object-fit: cover;
@@ -87,6 +86,10 @@ select option { background: var(--surface-2); }
   scroll-behavior: smooth;
 }
 #chat > * { width: 100%; max-width: 720px; margin-inline: auto; }
+/* messages must beat the #chat > * ID rule or bubbles render as full-width banners */
+#chat > .msg { width: fit-content; max-width: min(85%, 560px); }
+#chat > .me { margin-inline: auto 0; }
+#chat > .bot { margin-inline: 0 auto; }
 #chat::-webkit-scrollbar { width: 6px; }
 #chat::-webkit-scrollbar-thumb { background: var(--surface-2); border-radius: 3px; }
 #chat::-webkit-scrollbar-thumb:hover { background: #26282E; }
@@ -121,14 +124,38 @@ select option { background: var(--surface-2); }
   max-width: min(85%, 560px); padding: 12px 18px; line-height: 1.65;
   overflow-wrap: break-word; border-radius: var(--r);
 }
-.me { margin-left: auto; color: #fff; background: var(--accent); font-weight: 500; }
-.bot { margin-right: auto; background: var(--surface); border: 1px solid var(--line); white-space: pre-wrap; }
+/* the whole of what animate.css was loaded for; the reduced-motion block below
+   already neutralises it, so no JS gate is needed either */
+@keyframes popIn { from { opacity: 0; transform: translateY(8px); } }
+.msg, .hint { animation: popIn .32s var(--ease) both; }
+.me { margin-left: auto; color: #fff; background: #C42F3A; font-weight: 500; } /* deeper accent: white text clears 4.5:1 AA */
+.bot { margin-right: auto; background: var(--surface); border: 1px solid var(--line); }
+/* agent took a real-world action — mark the reply as a handoff receipt */
+.bot.booked { border-color: rgba(226, 55, 68, .45); }
+.bot.booked::before {
+  content: "Agent action · payment stays with you";
+  display: block; margin-bottom: 8px;
+  font-family: var(--font-label); font-size: 11px; line-height: 16px;
+  letter-spacing: .06em; text-transform: uppercase; color: var(--accent);
+}
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .bot h4 {
   margin: 16px 0 4px; font-family: var(--font-label); font-size: 11.5px; font-weight: 500;
   letter-spacing: .1em; text-transform: uppercase; color: var(--text-dim);
 }
 .bot h4:first-child { margin-top: 0; }
 .bot b { font-weight: 600; color: #fff; }
+.bot > *, .bot li { transition: opacity .2s var(--ease); }
+/* display:none (not opacity) while pending — a hidden-but-opacity-0 block still
+   reserves its layout height, which would make the bubble render at full final
+   height immediately and send autoscroll past whatever's actually been typed */
+.bot .reveal-pending { display: none; }
+.bot p { margin: 8px 0; }
+.bot p:first-child { margin-top: 0; }
+.bot ul { margin: 8px 0; padding-left: 18px; }
+.bot li { margin: 4px 0; }
+.bot li::marker { color: var(--accent); }
+.bot hr { margin: 14px 0; border: 0; border-top: 1px solid var(--line); }
 .bot a {
   display: inline-block; margin-top: 8px;
   font-size: 13px; font-weight: 600; color: var(--text); text-decoration: none;
@@ -142,6 +169,7 @@ select option { background: var(--surface-2); }
 /* typing indicator */
 .typing { display: flex; gap: 4px; align-items: center; width: fit-content; padding: 16px; }
 .typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim); animation: wave 1.2s infinite; }
+.typing .waitnote { font-size: 13px; color: var(--text-dim); margin-left: 4px; }
 .typing i:nth-child(2) { animation-delay: .15s; }
 .typing i:nth-child(3) { animation-delay: .3s; }
 @keyframes wave { 0%, 60%, 100% { opacity: .3; } 30% { opacity: 1; } }
@@ -169,7 +197,7 @@ input::placeholder { color: var(--text-dim); }
 }
 .iconbtn:hover { background: rgba(255, 255, 255, .06); color: var(--text); }
 .iconbtn svg { width: 18px; height: 18px; }
-.iconbtn[aria-pressed="false"] { opacity: .5; }
+#speak[aria-pressed="false"] { opacity: .5; } /* only the output toggle dims — the mic must never look disabled */
 #mic.listening { background: var(--accent); color: #fff; position: relative; }
 #mic.listening::after {
   content: ""; position: absolute; inset: -4px; border-radius: var(--r-ctl);
@@ -193,7 +221,7 @@ input::placeholder { color: var(--text-dim); }
   border-radius: 50%; animation: spin .7s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
-.disclaimer { max-width: 720px; margin: 8px auto 0; text-align: center; font-family: var(--font-label); font-size: 10.5px; letter-spacing: .02em; color: var(--text-dim); opacity: .7; }
+.disclaimer { max-width: 62ch; margin: 8px auto 0; text-align: center; font-family: var(--font-body); font-size: 12px; line-height: 16px; color: var(--text-dim); }
 
 /* header controls */
 header .iconbtn { width: 34px; height: 34px; border: 1px solid var(--line); }
@@ -203,7 +231,14 @@ header .iconbtn { width: 34px; height: 34px; border: 1px solid var(--line); }
   header { padding: 12px 16px; }
   #chat { padding: 16px; }
   .composer { padding: 12px 16px 16px; }
-  .msg { max-width: 92%; }
+  #chat > .msg { max-width: 92%; }
+  .circular-gallery { opacity: .28; } /* posters become backdrop — hero text stays legible */
+}
+@media (pointer: coarse) {
+  .iconbtn, header .iconbtn { width: 44px; height: 44px; }
+  .inputwrap { gap: 8px; }
+  .chip { min-height: 44px; }
+  select { min-height: 44px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
