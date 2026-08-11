@@ -85,6 +85,66 @@ Scraping notes, hard-earned:
 - District serves session times in UTC with no timezone marker (+5:30 to IST)
 - Listings snapshots are plain text files with a TTL — stale-while-revalidate, so answers never wait on a crawl
 
+## Metrics
+
+Measured on one Windows 11 laptop against the live sites — medians of a few runs,
+not a benchmark suite. Anything touching Gemini varies with their load.
+
+**Footprint and startup**
+
+| | before | now |
+|---|---|---|
+| third-party Python packages | 3 (langgraph, langchain-google-genai, playwright) | **0** |
+| `import agent` | 15.3s | **0.36s** |
+| server boot → first HTTP 200 | ~20s | **0.83s** |
+
+The old numbers were the cost of a framework doing one field-extraction call.
+Replacing it with a single Gemini call and a tool declaration removed both LLM
+dependencies; dropping Playwright for a deep link removed the last one.
+
+**Answering**
+
+| | |
+|---|---|
+| time to first token | **2.1s** over the tunnel, 3.6s local |
+| full answer (13–15k chars) | 16–21s |
+| dead air removed by streaming | **12.8–19.3s** |
+| LLM calls per booking turn | 1 (was 2) |
+| prompt carried per turn | ~13,000 tokens of listings |
+
+Time-to-first-token is roughly flat regardless of answer length — that is the model
+reading the listings. Everything after it streams, so the longer the answer, the
+more streaming wins.
+
+**Serving**
+
+| | before | now |
+|---|---|---|
+| `http://localhost:8765` p50 | 2050ms | **10ms** |
+| static assets, 40 concurrent | 19 req/s | **130+ req/s** |
+
+Both numbers were one bug: `localhost` resolves to `::1` before `127.0.0.1` on
+Windows, and the server was listening on IPv4 only, so every connection paid a
+~2s fallback. It now listens on both.
+
+**Data and booking**
+
+| | |
+|---|---|
+| full crawl | 73 fetches in **5s** |
+| listings snapshot | 52,000 chars across 7 sections, 5 days |
+| BookMyShow coverage, one city | ~150 venues / ~240 sessions today |
+| booking, question → seat map open | **4.7s** (was ~60s of browser driving, and broken) |
+
+**Code**
+
+| | |
+|---|---|
+| backend | 1,103 lines across 5 files |
+| tests | 930 lines across 3 files |
+| frontend | 658 JS + 305 CSS lines |
+| checks | 63 offline, 8 live |
+
 ## Tests
 
 Three files, three different jobs:
