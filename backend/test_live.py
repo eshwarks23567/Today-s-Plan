@@ -43,17 +43,20 @@ def main():
     venues = sessions = 0
     sample = None
     for mv in movies[:6]:
-        rows = booktic.bms_showtimes(dict(mv), datecode)
+        m = dict(mv)  # bms_showtimes sets m['book'] as a side effect — keep THAT dict,
+        rows = booktic.bms_showtimes(m, datecode)  # rather than re-crawling for it later
         venues += len(rows)
         sessions += sum(len(r["sessions"]) for r in rows)
         if rows and sample is None:
-            sample = (dict(mv), rows[0])
+            sample = (m, rows[0])
     check("BMS returns showtimes today", sessions > 0, f"{venues} venues, {sessions} sessions")
 
     if sample:
         mv, row = sample
-        booktic.bms_showtimes(mv, datecode)  # re-run to populate mv['book']
-        s = row["sessions"][0]
+        # the LAST session of the day, not the first: bms_seat_url re-fetches the page,
+        # and near a showtime the earliest listing can vanish between the two calls —
+        # which fails the check for a reason that has nothing to do with the link
+        s = row["sessions"][-1]
         check("BMS sessions carry a sane price", 20 <= s["min"] <= 5000, s)
         check("BMS sessions carry a showtime", bool(s.get("time")), s)
         # the deep link is what booking hands the user — if it stops resolving,
