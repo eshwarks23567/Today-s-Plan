@@ -145,6 +145,10 @@ def _warm(city: str):
 
 
 if __name__ == "__main__":
+    # movie titles and venue names are not ASCII, and Windows hands a redirected
+    # stderr the cp1252 codec — without this, logging one Telugu title raises
+    # UnicodeEncodeError inside the request thread and turns an answer into a 500
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
     threading.Thread(target=_warm, args=(prefs.load().get("home_city") or "hyderabad",),
                      daemon=True).start()

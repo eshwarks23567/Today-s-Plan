@@ -86,8 +86,33 @@ def initial_state(html: str) -> dict:
     return d
 
 
+def _showtime_prices(showtime: dict) -> tuple[list[float], str]:
+    """Per-category prices are no longer on the showtime itself — they live in the
+    bottom sheet the card opens on double-tap, one widget per seat category
+    (layoutId 'seat-category-type-<availability>') with the price as a display
+    string like '₹ 1,250.00'. Returns (prices, format) where format is
+    e.g. 'Hindi • 2D'."""
+    widgets = ((((showtime.get("customGestureCTA") or {}).get("additionalData") or {})
+                .get("bottomSheetData") or {}).get("widgets")) or []
+    prices, fmt = [], ""
+    for w in widgets:
+        var = w.get("variableData") or {}
+        layout = str(w.get("layoutId", ""))
+        if layout == "format-container":
+            fmt = var.get("format", "")
+        elif layout.startswith("seat-category-type-"):
+            digits = re.sub(r"[^\d.]", "", str(var.get("seatCost", "")))
+            if digits:
+                prices.append(float(digits))
+    return prices, fmt
+
+
 def bms_showtimes(movie: dict, datecode: str) -> list[dict]:
-    """BookMyShow: all venues/sessions/prices for one movie on one date."""
+    """BookMyShow: all venues/sessions/prices for one movie on one date.
+
+    BMS moved showtimes out of showtimesByEvent.showDates (which is now served
+    empty) and into showtimesFunctionalApi, keyed by a query name that embeds the
+    event, date and region — so the key is matched by prefix, not looked up."""
     # movie url: https://in.bookmyshow.com/hyderabad/movies/lenin/ET00441159
     # first path segment is BMS's canonical city slug — reuse it, don't trust user input
     m = re.search(r"bookmyshow\.com/([^/]+)/movies/([^/]+)/(ET\d+)", movie["url"])
@@ -96,31 +121,36 @@ def bms_showtimes(movie: dict, datecode: str) -> list[dict]:
     city, slug, code = m.groups()
     buy_url = f"https://in.bookmyshow.com/movies/{city}/{slug}/buytickets/{code}/{datecode}"
     try:
-        state = initial_state(fetch(buy_url))
-        day = state["showtimesByEvent"]["showDates"][datecode]
-        venues_meta = day["primaryStatic"]["data"]["venues"]
-        widgets = day["dynamic"]["data"]["showtimeWidgets"]
-    except (RuntimeError, KeyError):
+        queries = initial_state(fetch(buy_url))["showtimesFunctionalApi"]["queries"]
+        dyn = next(q["data"]["data"] for k, q in queries.items()
+                   if k.startswith("fetchPrimaryDynamic") and (q or {}).get("data"))
+    except (RuntimeError, KeyError, TypeError, StopIteration):
         return []  # no shows for this movie/date
+    # A movie with nothing on the requested date is served its NEXT available date
+    # instead of an empty page, so without this check next Friday's showtimes get
+    # filed under today — silently, and at the right-looking price.
+    if str(dyn.get("additionalData", {}).get("dateCode") or "") != datecode:
+        return []
     rows = []
-    for w in widgets:
+    for w in dyn.get("showtimeWidgets", []):
         if w.get("type") != "groupList":
             continue
-        for group in w["data"]:
+        for group in w.get("data", []):
             for card in group.get("data", []):
                 if card.get("type") != "venue-card":
                     continue
-                vmeta = venues_meta.get(card.get("id"), {})
                 sessions = []
-                for st in card.get("showtimes", []):
-                    ad = st.get("additionalData", {})
-                    prices = [float(c["curPrice"]) for c in ad.get("categories", []) if c.get("curPrice")]
-                    if not ad.get("showTime") or not prices:
-                        continue
-                    sessions.append({"time": ad["showTime"], "min": min(prices), "max": max(prices),
-                                     "attrs": ad.get("attributes", "")})
+                for section in card.get("showtimesSections", []):
+                    for st in section.get("showtimes", []):
+                        when = (st.get("additionalData") or {}).get("showTime")
+                        prices, fmt = _showtime_prices(st)
+                        if not when or not prices:
+                            continue
+                        sessions.append({"time": when, "min": min(prices), "max": max(prices),
+                                         "attrs": fmt})
                 if sessions:
-                    rows.append({"venue": vmeta.get("venueName", card.get("id", "?")), "sessions": sessions})
+                    venue = (card.get("additionalData") or {}).get("venueName") or card.get("id", "?")
+                    rows.append({"venue": venue, "sessions": sessions})
     if rows:
         movie["book"] = buy_url
     return rows
@@ -299,7 +329,10 @@ def _crawl_now(city: str, cache_file: Path) -> str:
     return text
 
 
-def ask_llm(question: str, listings: str, history: list[dict]) -> str:
+def ask_llm(question: str, listings: str, history: list[dict], tools: list | None = None):
+    """Answer grounded in the listings. Returns the reply text — or, when tools are
+    offered and the model calls one, the raw functionCall dict, in which case history
+    is left untouched for the caller to record once it knows what actually happened."""
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("Set GEMINI_API_KEY (free key: https://aistudio.google.com/apikey)")
@@ -316,18 +349,38 @@ def ask_llm(question: str, listings: str, history: list[dict]) -> str:
         "you only see that far ahead. The events/concerts section lists upcoming events with their "
         f"own dates. Today is {date.today().isoformat()}."
         + (f"\n\n{pref_line}" if pref_line else "")
-        + f"\n\n{listings}"
     )
+    if tools:
+        # These rules used to live in a separate planner prompt. Folded in here, the
+        # one model that reads the listings and its own earlier replies is also the
+        # one deciding to act — so "the second one" resolves against what it actually
+        # said, instead of against a six-message excerpt handed to a second call.
+        system += (
+            "\n\nYou can also open the user's browser on a specific show by calling the book "
+            "tool. Call it ONLY when they ask to book, select or open tickets now — not when "
+            "they are asking about showtimes. Never invent a venue or a showtime: fill those "
+            "only when the user named them, said 'my usual place' and a preferred venue is "
+            "known, or the conversation makes them unambiguous. Copy venue, time and book_url "
+            "verbatim from the listings. List in `inferred` every field you filled from context "
+            "or your own suggestion rather than from the user's own words this turn — but leave "
+            "it empty when they are simply confirming a plan you already proposed."
+        )
+    system += f"\n\n{listings}"
     # build the turn without mutating history yet: if the call fails, the caller
     # retries with the SAME list, and a pre-appended question would be sent twice
     # (Gemini then sees two consecutive user turns, and the client saves that
     # malformed history to localStorage for good)
     msg = {"role": "user", "parts": [{"text": question}]}
-    body = json.dumps({
-        "system_instruction": {"parts": [{"text": system}]},
-        "contents": history + [msg],
-    }).encode()
-    out = None
+    payload = {"system_instruction": {"parts": [{"text": system}]},
+               "contents": history + [msg]}
+    if tools:
+        payload["tools"] = tools
+    body = json.dumps(payload).encode()
+    out, last = None, None
+    # 429 = this model's free quota is spent, 500/503 = Gemini itself is wobbling.
+    # Both are worth trying the other model for; anything else is our own bug and
+    # should surface immediately rather than being retried into a vaguer message.
+    RETRYABLE = (429, 500, 503)
     for model in ("gemini-flash-latest", "gemini-flash-lite-latest"):  # lite = separate free quota
         req = urllib.request.Request(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
@@ -337,15 +390,24 @@ def ask_llm(question: str, listings: str, history: list[dict]) -> str:
                 out = json.load(r)
             break
         except urllib.error.HTTPError as e:
-            if e.code != 429:
+            if e.code not in RETRYABLE:
                 raise
+            last = e.code
     if out is None:
-        raise RuntimeError("Gemini free-tier quota exhausted on both models — try again in a minute.")
+        raise RuntimeError("Gemini free-tier quota exhausted on both models — try again in a minute."
+                           if last == 429 else
+                           f"Gemini is unavailable right now (HTTP {last}) — try again in a moment.")
     candidates = out.get("candidates") or []
     if not candidates:
         reason = out.get("promptFeedback", {}).get("blockReason", "no response")
         raise RuntimeError(f"Gemini returned no answer ({reason})")
-    answer = candidates[0]["content"]["parts"][0]["text"]
+    parts = (candidates[0].get("content") or {}).get("parts") or []
+    for p in parts:
+        if "functionCall" in p:
+            return p["functionCall"]  # caller records the turn once it knows the outcome
+    answer = "".join(p.get("text", "") for p in parts)
+    if not answer.strip():
+        raise RuntimeError(f"Gemini returned an empty answer ({candidates[0].get('finishReason')})")
     history.append(msg)
     history.append({"role": "model", "parts": [{"text": answer}]})
     return answer
