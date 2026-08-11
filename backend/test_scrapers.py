@@ -313,9 +313,9 @@ def test_agent_confirms_before_acting():
 
     def fake_open(*a, **k):
         opened.append(a)
-        return "https://x/seat-layout", False  # False: never let a test touch prefs.json
+        return "https://in.bookmyshow.com/movies/hyd/seat-layout/ET1/AC/1/20260811", False  # False: never let a test touch prefs.json
 
-    call = {"movie": "Alpha", "book_url": "https://x/buytickets/ET1/20260811",
+    call = {"movie": "Alpha", "book_url": "https://in.bookmyshow.com/movies/hyderabad/a/buytickets/ET1/20260811",
             "venue": "INOX Odeon", "time": "07:35 PM", "seats": 2, "inferred": ["venue", "time"]}
     real_open = agent.open_booking
     try:
@@ -330,7 +330,7 @@ def test_agent_confirms_before_acting():
                    {"role": "model", "parts": [{"text": agent._confirmation(call)}]}]
         answer, booked, url = agent._book(call, history, "hyderabad")
         check("confirming acts instead of asking again", booked and len(opened) == 1)
-        check("the resolved link comes back for the client to open", url == "https://x/seat-layout")
+        check("the resolved link comes back for the client to open", url == "https://in.bookmyshow.com/movies/hyd/seat-layout/ET1/AC/1/20260811")
 
         # a plan the user stated outright should never stall on a question
         stated = dict(call, inferred=[])
@@ -350,6 +350,37 @@ def test_agent_confirms_before_acting():
           agent._awaiting_confirmation([{"role": "model", "parts": [{"text": agent._confirmation(call)}]}]))
     check("an ordinary reply is not mistaken for a confirmation",
           not agent._awaiting_confirmation([{"role": "model", "parts": [{"text": "Alpha is at 7:35 PM."}]}]))
+
+
+def test_safe_booking_url():
+    """book_url comes from the model, which we tell to copy links out of listings we
+    scraped — and BookMyShow event titles are user-submitted. webbrowser.open() is
+    os.startfile() on Windows, so an unchecked string there launches whatever the
+    shell would. The same value is also rendered into an href on the page."""
+    for good in ("https://in.bookmyshow.com/movies/hyd/seat-layout/ET1/AC/1/20260811",
+                 "https://www.district.in/movies/x-MV1",
+                 "http://in.bookmyshow.com/a"):
+        check(f"allows a ticketing link ({good[:34]}…)", agent.safe_booking_url(good) == good)
+    for bad, why in [
+        ("file:///C:/Windows/System32/calc.exe", "file:// scheme"),
+        ("C:\\Windows\\System32\\calc.exe", "a bare executable path"),
+        ("javascript:alert(1)", "javascript: (this value is also put in an href)"),
+        ("\\\\attacker\\share\\payload.exe", "a UNC path"),
+        ("https://evil.com/x", "an unrelated host"),
+        ("https://in.bookmyshow.com.evil.com/x", "a lookalike domain"),
+        ("", "an empty url"),
+    ]:
+        check(f"blocks {why}", agent.safe_booking_url(bad) is None)
+    check("open_booking refuses to open anything that fails the check",
+          _raises(lambda: agent.open_booking("file:///C:/x.exe", "", "", auto_open=False)))
+
+
+def _raises(fn) -> bool:
+    try:
+        fn()
+    except Exception:
+        return True
+    return False
 
 
 def test_prefs_concurrency():
@@ -444,6 +475,7 @@ def main():
     print("ask_llm history"); test_ask_llm_history()
     print("ask_llm tool calls"); test_ask_llm_tool_call()
     print("agent confirmation"); test_agent_confirms_before_acting()
+    print("booking url allowlist"); test_safe_booking_url()
     print("concurrency"); test_prefs_concurrency(); test_atomic_swap()
 
     booktic.fetch = real_fetch

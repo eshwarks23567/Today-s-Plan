@@ -11,9 +11,30 @@ venue or showtime the user never actually said, we ask first (see CONFIRM_TAIL).
 import sys
 import traceback
 import webbrowser
+from urllib.parse import urlparse
 
 import booktic
 import prefs
+
+# Only these ever get handed to a browser. webbrowser.open() is os.startfile() on
+# Windows, which launches whatever the shell would — an .exe path, a UNC share, a
+# file:// URL. The string arrives from the model, which we instruct to copy links
+# verbatim out of listings we scraped, and BookMyShow event titles are
+# user-submitted. That is remote input reaching a shell-execute call with only a
+# language model in between, so the scheme and host are checked, not trusted.
+BOOKING_HOSTS = {"in.bookmyshow.com", "bookmyshow.com",
+                 "www.district.in", "district.in"}
+
+
+def safe_booking_url(url: str) -> str | None:
+    """The url if it is an http(s) link to a ticketing host we know, else None."""
+    try:
+        u = urlparse((url or "").strip())
+    except ValueError:
+        return None
+    if u.scheme not in ("http", "https"):
+        return None
+    return url.strip() if (u.hostname or "").lower() in BOOKING_HOSTS else None
 
 # Ends every confirmation question, and is the only marker that a confirmation is
 # outstanding: the client owns the session, so history is the whole of our state.
@@ -77,7 +98,7 @@ def handle(question: str, history: list, listings: str, city: str, on_token=None
 
 
 def _book(call: dict, history: list, city: str, auto_open: bool = True) -> tuple[str, bool, str | None]:
-    url = (call.get("book_url") or "").strip()
+    url = safe_booking_url(call.get("book_url") or "")
     if not url:
         return ("I couldn't match that to a specific show or event. Tell me the title, and for "
                 "movies the venue and showtime (e.g. \"book 2 tickets for Alpha at INOX Odeon "
@@ -133,9 +154,12 @@ def open_booking(url: str, venue: str, time_str: str, auto_open: bool = True) ->
             deep = booktic.bms_seat_url(url, venue, time_str)
         except Exception:
             traceback.print_exc(file=sys.stderr)  # fall back to the movie page
+    target = safe_booking_url(deep or url)
+    if not target:  # a resolved link should always pass, but never open what didn't
+        raise ValueError(f"refusing to open a non-ticketing URL: {(deep or url)[:80]!r}")
     if auto_open:
-        webbrowser.open(deep or url)
-    return deep or url, bool(deep)
+        webbrowser.open(target)
+    return target, bool(deep)
 
 
 def _confirmation(call: dict) -> str:

@@ -27,8 +27,12 @@ def _check_city(city: str) -> None:
 
 def fetch(url: str) -> str:
     # ponytail: shelling out to curl because Akamai 403s python TLS; swap to curl_cffi if this breaks
+    # --proto pins this to https even after a redirect: most urls here come out of
+    # scraped JSON-LD, and curl speaks file://, scp:// and more, so an attacker-set
+    # link in a listing could otherwise make us read local files into the prompt
     r = subprocess.run(
-        ["curl", "-s", "-L", "--max-time", "30", "-A", UA, url],
+        ["curl", "-s", "-L", "--proto", "=https", "--proto-redir", "=https",
+         "--max-time", "30", "-A", UA, url],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     if r.returncode != 0 or not r.stdout:
