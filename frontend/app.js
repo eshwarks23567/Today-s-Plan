@@ -239,7 +239,13 @@ async function ask(text) {
     history = done.history;
     showFresh(done.crawled);
     const cls = done.booked ? "bot booked" : "bot";
-    const html = md(done.answer);
+    // Reached over a tunnel the server won't have opened anything — it can't reach
+    // this device's browser — so booking comes back as a link to tap instead.
+    let html = md(done.answer);
+    if (done.url) {
+      const label = done.url.includes("/seat-layout/") ? "Open seat map" : "Open booking page";
+      html += `<a href="${done.url.replace(/"/g, "&quot;")}" target="_blank" rel="noopener">${label} →</a>`;
+    }
     if (bubble) {
       bubble.className = "msg " + cls;
       bubble.innerHTML = html;

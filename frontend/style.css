@@ -234,6 +234,9 @@ header .iconbtn { width: 34px; height: 34px; border: 1px solid var(--line); }
   .inputwrap { gap: 8px; }
   .chip { min-height: 44px; }
   select { min-height: 44px; }
+  /* the booking link is the primary action on a phone — inline-block leaves it
+     ~39px tall, under the touch minimum, so give it a real target */
+  .bot a { display: inline-flex; align-items: center; min-height: 44px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
