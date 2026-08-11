@@ -13,7 +13,6 @@ const PLACEHOLDER = innerWidth < 420 ? "Ask anything…" : "Ask about movies, ti
 const BOOKISH = /\b(book|ticket|tickets|seat|seats|reserve|buy)\b/i;
 q.placeholder = PLACEHOLDER;
 let inflight = null; // AbortController for the request currently in flight, if any
-let currentTypewriter = null; // { finish() } for the reply currently typing out, if any
 
 // pristine markup, captured once, so "new chat" can restore the homepage without a reload
 const HERO_HTML = $("hero").outerHTML;
@@ -184,37 +183,80 @@ async function ask(text) {
   // a hung server would otherwise leave the dots spinning forever
   let timedOut = false;
   const limit = setTimeout(() => { timedOut = true; inflight?.abort(); }, 120000);
+  let bubble = null, full = "", pending = false;
+  // Re-render the accumulated markdown at most once a frame: tokens arrive far
+  // faster than the eye resolves, and md() on every one of them is wasted work.
+  const paint = () => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      if (!bubble) return;
+      bubble.innerHTML = md(full);
+      chat.scrollTop = chat.scrollHeight;
+    });
+  };
   try {
     const r = await fetch("/api/ask", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ city: citySel.value, question: text, history }),
       signal: inflight.signal,
     });
-    const out = await r.json();
-    if (out.error) { retryHint("Something went wrong: " + out.error, text); return; }
-    history = out.history;
-    showFresh(out.crawled);
-    const cls = out.booked ? "bot booked" : "bot";
-    const bubble = add(cls, md(out.answer), true);
-    record(cls, md(out.answer), true);
-    if (motionOK) {
-      // screen readers get the full answer once via this mirror; the visual bubble
-      // is hidden from them while the typewriter churns its text nodes
-      const sr = document.createElement("div");
-      sr.className = "sr-only";
-      sr.textContent = plain(out.answer);
-      chat.appendChild(sr);
-      bubble.setAttribute("aria-hidden", "true");
-      chat.style.scrollBehavior = "auto"; // smooth scrolling fights per-frame typing scroll
-      currentTypewriter = typeIn(bubble, () => {
-        bubble.removeAttribute("aria-hidden");
-        sr.remove();
-        chat.style.scrollBehavior = "";
-        currentTypewriter = null;
-      });
+    // errors (400/429/500) still answer as plain JSON — only the answer streams
+    if (!(r.headers.get("content-type") || "").includes("text/event-stream")) {
+      const out = await r.json();
+      retryHint("Something went wrong: " + (out.error || r.status), text);
+      return;
     }
-    if (speakOn) say(out.answer);
+    let done = null;
+    for await (const ev of sseEvents(r.body, inflight.signal)) {
+      if (ev.type === "status") {
+        wait.querySelector(".waitnote")?.remove();
+        const note = document.createElement("span");
+        note.className = "waitnote";
+        note.textContent = ev.text;
+        wait.appendChild(note);
+      } else if (ev.type === "token") {
+        if (!bubble) {
+          clearTimeout(slow);
+          wait.remove();
+          bubble = add("bot", "", true);
+          // the live region would otherwise announce every partial re-render;
+          // the finished answer is announced once, below
+          bubble.setAttribute("aria-hidden", "true");
+          chat.style.scrollBehavior = "auto";
+        }
+        full += ev.text;
+        paint();
+      } else if (ev.type === "error") {
+        retryHint("Something went wrong: " + ev.error, text);
+        return;
+      } else if (ev.type === "done") {
+        done = ev;
+      }
+    }
+    if (!done) { retryHint("The answer was cut off.", text); return; }
+    history = done.history;
+    showFresh(done.crawled);
+    const cls = done.booked ? "bot booked" : "bot";
+    const html = md(done.answer);
+    if (bubble) {
+      bubble.className = "msg " + cls;
+      bubble.innerHTML = html;
+      bubble.removeAttribute("aria-hidden");
+      chat.style.scrollBehavior = "";
+    } else {
+      bubble = add(cls, html, true);   // booking replies carry no streamed prose
+    }
+    const sr = add("hint", plain(done.answer));  // announced once by the live region
+    sr.className = "sr-only";
+    record(cls, html, true);
+    chat.scrollTop = chat.scrollHeight;
+    if (speakOn) say(done.answer);
   } catch (e) {
+    // a half-streamed answer was never recorded, so leaving it on screen would show
+    // text that no longer exists in the conversation the server and storage agree on
+    bubble?.remove();
     if (e.name !== "AbortError") retryHint("Connection failed: " + e.message, text);
     else if (timedOut) retryHint("That took too long — the server may still be crawling listings.", text);
     // otherwise it was Esc: the user cancelled on purpose, nothing to say
@@ -237,6 +279,31 @@ function showFresh(unixSeconds) {
     `Listings updated ${Math.round(mins)} min ago`) + " · ";
 }
 
+// Parse an SSE body into decoded events. Frames are separated by a blank line and
+// can split across chunk boundaries, so buffer until a separator actually arrives.
+async function* sseEvents(body, signal) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let sep;
+      while ((sep = buf.indexOf("\n\n")) !== -1) {
+        const frame = buf.slice(0, sep);
+        buf = buf.slice(sep + 2);
+        const data = frame.split("\n").filter(l => l.startsWith("data:"))
+          .map(l => l.slice(5).trim()).join("");
+        if (data) { try { yield JSON.parse(data); } catch {} }
+      }
+    }
+  } finally {
+    if (signal?.aborted) reader.cancel().catch(() => {});
+  }
+}
+
 form.onsubmit = (e) => {
   e.preventDefault();
   const t = q.value.trim();
@@ -251,96 +318,6 @@ function retryHint(message, question) {
   b.textContent = "Retry";
   b.onclick = () => { h.remove(); ask(question); };
   h.appendChild(b);
-}
-
-// typewriter reveal: the bubble already holds the final HTML; empty its text
-// nodes, then type them back a few chars per frame, pausing at sentence ends.
-// Click anywhere on the bubble (except a link) to finish instantly.
-//
-// Reveals one block at a time (paragraph, list item, rule) rather than typing
-// every text node across the whole tree at once — the flat approach left
-// not-yet-typed list items and booking-link buttons sitting on screen as
-// empty placeholder boxes (an <a> button has padding/background/border, so
-// an empty one is a visible gray pill ahead of the cursor). Booking-link
-// buttons pop in whole instead of typing letter by letter — "B", "Bo", "Book"
-// on something you click reads oddly, since it isn't prose.
-function typeIn(el, onDone) {
-  const targets = [...el.querySelectorAll(":scope > *, :scope ul > li")];
-  const popIn = new Set(targets.filter(t => t.tagName === "HR" ||
-    (t.tagName === "LI" && t.childElementCount === 1 && t.firstElementChild.tagName === "A")));
-  targets.forEach(t => t.classList.add("reveal-pending"));
-
-  const allText = (root) => {
-    const out = [];
-    (function walk(n) { for (const c of [...n.childNodes])
-      c.nodeType === 3 ? out.push([c, c.textContent]) : walk(c); })(root);
-    return out;
-  };
-  // like allText, but stops at any descendant that is itself a target — so a
-  // <ul>'s pass doesn't re-type text its own <li> targets will type themselves
-  const ownText = (root) => {
-    const out = [];
-    (function walk(n) {
-      for (const c of [...n.childNodes]) {
-        if (c.nodeType === 3) out.push([c, c.textContent]);
-        else if (!targets.includes(c)) walk(c);
-      }
-    })(root);
-    return out;
-  };
-
-  let finished = false;
-  const finish = () => {
-    if (finished) return;
-    finished = true;
-    targets.forEach(t => { t.classList.remove("reveal-pending"); t.style.opacity = ""; });
-    allText(el).forEach(([n, full]) => n.textContent = full);
-    chat.scrollTop = chat.scrollHeight;
-    if (onDone) onDone();
-  };
-  el.addEventListener("click", (e) => { if (!e.target.closest("a")) finish(); });
-
-  let ti = 0;
-  const nextTarget = () => {
-    if (finished) return;
-    if (ti >= targets.length) return finish();
-    const t = targets[ti++];
-    // reveal-pending is display:none (zero height) so the bubble's real height
-    // only grows as content actually appears — otherwise every still-hidden
-    // block below would already count toward scrollHeight, and autoscroll
-    // would land in blank space past whatever has actually been typed so far.
-    // Un-hiding switches display back on; only THEN does the opacity fade run,
-    // so the fade never fights the layout math.
-    t.classList.remove("reveal-pending");
-    t.style.opacity = "0";
-    requestAnimationFrame(() => { t.style.opacity = "1"; });
-    chat.scrollTop = chat.scrollHeight;
-    if (popIn.has(t)) { setTimeout(nextTarget, 90); return; }
-    typeNodes(ownText(t), nextTarget);
-  };
-
-  function typeNodes(nodes, done) {
-    nodes.forEach(([n]) => n.textContent = "");
-    let i = 0, j = 0, pause = 0;
-    (function step() {
-      if (finished) return;
-      if (pause-- > 0) { requestAnimationFrame(step); return; }
-      let budget = 3;
-      while (budget-- > 0 && i < nodes.length) {
-        const [node, full] = nodes[i];
-        if (j >= full.length) { i++; j = 0; continue; }
-        const ch = full[j];
-        node.textContent = full.slice(0, ++j);
-        if (".!?".includes(ch)) { pause = 8; break; }   // breathe between sentences
-        if (ch === ",") { pause = 3; break; }
-      }
-      chat.scrollTop = chat.scrollHeight;
-      if (i < nodes.length) requestAnimationFrame(step); else done();
-    })();
-  }
-
-  nextTarget();
-  return { finish };
 }
 
 // ---- voice out (browser-native) ----
@@ -415,8 +392,7 @@ addEventListener("keydown", (e) => {
   if (e.key === "/" && document.activeElement !== q) { e.preventDefault(); q.focus(); }
   if (e.key !== "Escape") return;
   speechSynthesis.cancel();
-  if (currentTypewriter) currentTypewriter.finish();
-  else if (inflight) inflight.abort();
+  if (inflight) inflight.abort();
 });
 
 // ---- voice in (browser-native, Chrome/Edge) ----

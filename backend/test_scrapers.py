@@ -210,6 +210,36 @@ def test_bms_events_single_event_fallback(monkeypatch_fetch):
     check("bms_events fallback extracts and normalizes price", "Rs 799" in line)
 
 
+def test_bms_seat_url(monkeypatch_fetch):
+    """The seat-layout deep link is assembled from data BMS publishes on the
+    buytickets page — region from the query key, venueCode from the card,
+    sessionId from the showtime."""
+    datecode = "20260714"
+    buy = f"https://in.bookmyshow.com/movies/hyderabad/alpha/buytickets/ET00403805/{datecode}"
+
+    monkeypatch_fetch(bms_buytickets_html(datecode))
+    url = booktic.bms_seat_url(buy, "AMB Cinemas: Gachibowli", "07:20 PM")
+    check("bms_seat_url builds the exact seat-layout link",
+          url == f"https://in.bookmyshow.com/movies/hyd/seat-layout/ET00403805/AMBH/254602/{datecode}")
+
+    monkeypatch_fetch(bms_buytickets_html(datecode))
+    check("bms_seat_url matches a venue by its name before the colon",
+          booktic.bms_seat_url(buy, "AMB Cinemas", "07:20 PM") == url)
+
+    monkeypatch_fetch(bms_buytickets_html(datecode))
+    check("bms_seat_url returns None for a showtime that is not there",
+          booktic.bms_seat_url(buy, "AMB Cinemas: Gachibowli", "11:55 PM") is None)
+
+    monkeypatch_fetch(bms_buytickets_html(datecode))
+    check("bms_seat_url returns None for a different venue",
+          booktic.bms_seat_url(buy, "PVR Nexus", "07:20 PM") is None)
+
+    # the wrong-date trap applies here too: never deep-link into another day
+    monkeypatch_fetch(bms_buytickets_html(datecode, served_datecode="20260721"))
+    check("bms_seat_url refuses a page BMS served for a different date",
+          booktic.bms_seat_url(buy, "AMB Cinemas: Gachibowli", "07:20 PM") is None)
+
+
 def test_section():
     mv = {"title": "Alpha", "book": "https://x/alpha"}
     single = booktic.section(mv, [{"venue": "INOX", "sessions": [{"time": "7:35 PM", "min": 105.0, "max": 105.0}]}])
@@ -278,20 +308,20 @@ def test_ask_llm_tool_call():
 
 def test_agent_confirms_before_acting():
     """Nothing consequential off an inference alone: a plan carrying fields the model
-    filled in itself must come back as a question, not as a driven browser."""
-    drove = []
+    filled in itself must come back as a question, not as an opened browser."""
+    opened = []
 
-    def fake_drive(*a, **k):
-        drove.append(a)
-        return ["opened booking page"], False  # False: never let a test touch prefs.json
+    def fake_open(*a, **k):
+        opened.append(a)
+        return "https://x/seat-layout", False  # False: never let a test touch prefs.json
 
     call = {"movie": "Alpha", "book_url": "https://x/buytickets/ET1/20260811",
             "venue": "INOX Odeon", "time": "07:35 PM", "seats": 2, "inferred": ["venue", "time"]}
-    real_drive = agent.drive_browser
+    real_open = agent.open_booking
     try:
-        agent.drive_browser = fake_drive
+        agent.open_booking = fake_open
         answer, booked = agent._book(call, [], "hyderabad")
-        check("an inferred plan asks before opening a browser", not booked and not drove)
+        check("an inferred plan asks before opening a browser", not booked and not opened)
         check("the question names the show it is about to open",
               "INOX Odeon" in answer and "07:35 PM" in answer and agent.CONFIRM_TAIL in answer)
 
@@ -299,18 +329,18 @@ def test_agent_confirms_before_acting():
         history = [{"role": "user", "parts": [{"text": "book alpha"}]},
                    {"role": "model", "parts": [{"text": agent._confirmation(call)}]}]
         answer, booked = agent._book(call, history, "hyderabad")
-        check("confirming acts instead of asking again", booked and len(drove) == 1)
+        check("confirming acts instead of asking again", booked and len(opened) == 1)
 
         # a plan the user stated outright should never stall on a question
         stated = dict(call, inferred=[])
         agent._book(stated, [], "hyderabad")
-        check("a fully stated plan books straight away", len(drove) == 2)
+        check("a fully stated plan books straight away", len(opened) == 2)
 
         # a field named as inferred but left empty is not a reason to stop
         agent._book(dict(call, inferred=["category"]), [], "hyderabad")
-        check("an inferred field that was never filled does not block", len(drove) == 3)
+        check("an inferred field that was never filled does not block", len(opened) == 3)
     finally:
-        agent.drive_browser = real_drive
+        agent.open_booking = real_open
 
     answer, booked = agent._book({"movie": "Alpha"}, [], "hyderabad")
     check("a plan with no booking URL neither asks nor acts",
@@ -332,6 +362,7 @@ def main():
     print("bms_showtimes"); test_bms_showtimes(install)
     print("district_showtimes"); test_district_showtimes(install)
     print("bms_events (single-event regex fallback)"); test_bms_events_single_event_fallback(install)
+    print("bms_seat_url"); test_bms_seat_url(install)
     print("section"); test_section()
     print("ask_llm history"); test_ask_llm_history()
     print("ask_llm tool calls"); test_ask_llm_tool_call()

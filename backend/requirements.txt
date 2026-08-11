@@ -1,1 +1,2 @@
-playwright
+# No third-party dependencies — the backend is stdlib only.
+# (Gemini is called over plain urllib; booking opens the system browser.)

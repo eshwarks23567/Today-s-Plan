@@ -49,18 +49,18 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/posters"):
             from urllib.parse import parse_qs, urlparse
             city = parse_qs(urlparse(self.path).query).get("city", ["hyderabad"])[0]
+            # The homepage asks for posters in whatever city the browser remembers,
+            # which is the first the server hears of it — so use that to warm the
+            # right city's crawl, rather than guessing from prefs at boot.
             try:
-                code, out = 200, booktic.posters(city)
+                if city in booktic.CITIES and not booktic.crawled_at(city):
+                    threading.Thread(target=_warm, args=(city,), daemon=True).start()
+                return self._json(200, booktic.posters(city))
             except ValueError as e:
-                code, out = 400, {"error": str(e)}
+                return self._json(400, {"error": str(e)})
             except Exception as e:
                 _log_error()
-                code, out = 500, {"error": str(e)}
-            body = json.dumps(out).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            return self.wfile.write(body)
+                return self._json(500, {"error": str(e)})
         name = "index.html" if self.path == "/" else self.path.lstrip("/")
         # Resolve to a canonical absolute path and verify it's still inside FRONTEND,
         # rather than blacklisting "/" and "..": a bare leading backslash (no slash,
@@ -90,12 +90,8 @@ class Handler(BaseHTTPRequestHandler):
         _limiter.prune()  # a LAN sees a handful of IPs; scanning them beats tracking a timer
         wait = _limiter.check(self.client_address[0])
         if wait:
-            body = json.dumps({"error": f"Too many requests — try again in {wait}s."}).encode()
-            self.send_response(429)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Retry-After", str(wait))
-            self.end_headers()
-            return self.wfile.write(body)
+            return self._json(429, {"error": f"Too many requests — try again in {wait}s."},
+                              **{"Retry-After": str(wait)})
         try:
             length = int(self.headers.get("Content-Length", 0))
             if length <= 0:
@@ -114,19 +110,58 @@ class Handler(BaseHTTPRequestHandler):
             history = req.get("history", [])
             if not isinstance(history, list):
                 raise ValueError("'history' must be a list")
+            # Shape-check every turn before it reaches Gemini: a malformed history
+            # otherwise comes back as an opaque 400 from the API, and history is the
+            # one input that arrives wholesale from the client on every request.
+            for turn in history:
+                if (not isinstance(turn, dict) or turn.get("role") not in ("user", "model")
+                        or not isinstance(turn.get("parts"), list) or not turn["parts"]
+                        or not all(isinstance(p, dict) and isinstance(p.get("text"), str)
+                                   for p in turn["parts"])):
+                    raise ValueError("malformed 'history' turn")
             city = req.get("city", "hyderabad")
             listings = booktic.crawl(city)  # raises ValueError for an unknown city
-            answer, booked = agent.handle(question, history, listings, city)
-            code, out = 200, {"answer": answer, "history": history, "booked": booked,
-                              "crawled": booktic.crawled_at(city)}
         except (json.JSONDecodeError, ValueError) as e:
-            code, out = 400, {"error": str(e)}
+            return self._json(400, {"error": str(e)})
         except Exception as e:
             _log_error()
-            code, out = 500, {"error": str(e)}
-        body = json.dumps(out).encode()
+            return self._json(500, {"error": str(e)})
+
+        # Everything above could still choose a status code. From here the answer
+        # streams, so the 200 is already committed and a later failure has to arrive
+        # as an error *event* instead.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        def send(**event):
+            self.wfile.write(b"data: " + json.dumps(event).encode() + b"\n\n")
+            self.wfile.flush()
+
+        try:
+            answer, booked = agent.handle(
+                question, history, listings, city,
+                on_token=lambda t: send(type="token", text=t),
+                on_status=lambda t: send(type="status", text=t))
+            send(type="done", answer=answer, history=history, booked=booked,
+                 crawled=booktic.crawled_at(city))
+        except (BrokenPipeError, ConnectionError):
+            pass  # the tab was closed or Esc aborted mid-answer; nothing to report to
+        except Exception as e:
+            _log_error()
+            try:
+                send(type="error", error=str(e))
+            except (BrokenPipeError, ConnectionError):
+                pass
+
+    def _json(self, code: int, payload, **headers):
+        body = json.dumps(payload).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        for k, v in headers.items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -149,10 +184,21 @@ if __name__ == "__main__":
     # stderr the cp1252 codec — without this, logging one Telugu title raises
     # UnicodeEncodeError inside the request thread and turns an answer into a 500
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+    args = [a for a in sys.argv[1:] if a != "--lan"]
+    port = int(args[0]) if args else 8765
+    # Booking opens a browser window on THIS machine, so listening on every
+    # interface hands that to anyone sharing the Wi-Fi. Loopback by default;
+    # --lan is the deliberate opt-in for reaching it from your phone.
+    lan = "--lan" in sys.argv
+    host = "0.0.0.0" if lan else "127.0.0.1"
     threading.Thread(target=_warm, args=(prefs.load().get("home_city") or "hyderabad",),
                      daemon=True).start()
     print(f"Today's Plan running at http://localhost:{port}")
-    print(f"On your phone (same Wi-Fi): http://{lan_ip()}:{port}  — local network only, no login")
+    if lan:
+        print(f"On your phone (same Wi-Fi): http://{lan_ip()}:{port}")
+        print("  ! open to everyone on this network, with no login — booking opens browser")
+        print("    windows on this machine, so only use --lan on a network you trust")
+    else:
+        print("  this machine only — pass --lan to reach it from your phone")
     print("(Ctrl+C to stop)")
-    ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    ThreadingHTTPServer((host, port), Handler).serve_forever()

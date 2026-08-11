@@ -145,11 +145,6 @@ select option { background: var(--surface-2); }
 }
 .bot h4:first-child { margin-top: 0; }
 .bot b { font-weight: 600; color: #fff; }
-.bot > *, .bot li { transition: opacity .2s var(--ease); }
-/* display:none (not opacity) while pending — a hidden-but-opacity-0 block still
-   reserves its layout height, which would make the bubble render at full final
-   height immediately and send autoscroll past whatever's actually been typed */
-.bot .reveal-pending { display: none; }
 .bot p { margin: 8px 0; }
 .bot p:first-child { margin-top: 0; }
 .bot ul { margin: 8px 0; padding-left: 18px; }

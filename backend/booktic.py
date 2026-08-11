@@ -107,31 +107,24 @@ def _showtime_prices(showtime: dict) -> tuple[list[float], str]:
     return prices, fmt
 
 
-def bms_showtimes(movie: dict, datecode: str) -> list[dict]:
-    """BookMyShow: all venues/sessions/prices for one movie on one date.
+def _bms_page(buy_url: str) -> tuple[str, str, list[dict]]:
+    """Parse a buytickets page once, flat. Returns (region code, the date the page
+    ACTUALLY served, sessions) — both the listings crawl and the seat-layout deep
+    link read from this single traversal.
 
-    BMS moved showtimes out of showtimesByEvent.showDates (which is now served
-    empty) and into showtimesFunctionalApi, keyed by a query name that embeds the
-    event, date and region — so the key is matched by prefix, not looked up."""
-    # movie url: https://in.bookmyshow.com/hyderabad/movies/lenin/ET00441159
-    # first path segment is BMS's canonical city slug — reuse it, don't trust user input
-    m = re.search(r"bookmyshow\.com/([^/]+)/movies/([^/]+)/(ET\d+)", movie["url"])
-    if not m:
-        return []
-    city, slug, code = m.groups()
-    buy_url = f"https://in.bookmyshow.com/movies/{city}/{slug}/buytickets/{code}/{datecode}"
+    BMS moved showtimes out of showtimesByEvent.showDates (now served empty) into
+    showtimesFunctionalApi, under a query name that embeds event, date and region
+    — so the key is matched by prefix, and the region is read back out of it."""
     try:
         queries = initial_state(fetch(buy_url))["showtimesFunctionalApi"]["queries"]
-        dyn = next(q["data"]["data"] for k, q in queries.items()
-                   if k.startswith("fetchPrimaryDynamic") and (q or {}).get("data"))
+        key, q = next((k, v) for k, v in queries.items()
+                      if k.startswith("fetchPrimaryDynamic") and (v or {}).get("data"))
+        dyn = q["data"]["data"]
     except (RuntimeError, KeyError, TypeError, StopIteration):
-        return []  # no shows for this movie/date
-    # A movie with nothing on the requested date is served its NEXT available date
-    # instead of an empty page, so without this check next Friday's showtimes get
-    # filed under today — silently, and at the right-looking price.
-    if str(dyn.get("additionalData", {}).get("dateCode") or "") != datecode:
-        return []
-    rows = []
+        return "", "", []
+    region = key.rsplit("-", 1)[-1]  # fetchPrimaryDynamic-ET00447840---20260811-HYD
+    served = str((dyn.get("additionalData") or {}).get("dateCode") or "")
+    sessions = []
     for w in dyn.get("showtimeWidgets", []):
         if w.get("type") != "groupList":
             continue
@@ -139,21 +132,70 @@ def bms_showtimes(movie: dict, datecode: str) -> list[dict]:
             for card in group.get("data", []):
                 if card.get("type") != "venue-card":
                     continue
-                sessions = []
+                cad = card.get("additionalData") or {}
                 for section in card.get("showtimesSections", []):
                     for st in section.get("showtimes", []):
-                        when = (st.get("additionalData") or {}).get("showTime")
+                        sad = st.get("additionalData") or {}
                         prices, fmt = _showtime_prices(st)
-                        if not when or not prices:
+                        if not sad.get("showTime") or not prices:
                             continue
-                        sessions.append({"time": when, "min": min(prices), "max": max(prices),
-                                         "attrs": fmt})
-                if sessions:
-                    venue = (card.get("additionalData") or {}).get("venueName") or card.get("id", "?")
-                    rows.append({"venue": venue, "sessions": sessions})
+                        sessions.append({
+                            "venue": cad.get("venueName") or card.get("id", "?"),
+                            "venue_code": cad.get("venueCode", ""),
+                            "session_id": str(sad.get("sessionId", "")),
+                            "time": sad["showTime"],
+                            "min": min(prices), "max": max(prices), "attrs": fmt})
+    return region, served, sessions
+
+
+def bms_showtimes(movie: dict, datecode: str) -> list[dict]:
+    """BookMyShow: all venues/sessions/prices for one movie on one date."""
+    # movie url: https://in.bookmyshow.com/hyderabad/movies/lenin/ET00441159
+    # first path segment is BMS's canonical city slug — reuse it, don't trust user input
+    m = re.search(r"bookmyshow\.com/([^/]+)/movies/([^/]+)/(ET\d+)", movie["url"])
+    if not m:
+        return []
+    city, slug, code = m.groups()
+    buy_url = f"https://in.bookmyshow.com/movies/{city}/{slug}/buytickets/{code}/{datecode}"
+    _, served, sessions = _bms_page(buy_url)
+    # A movie with nothing on the requested date is served its NEXT available date
+    # instead of an empty page, so without this check next Friday's showtimes get
+    # filed under today — silently, and at the right-looking price.
+    if served != datecode:
+        return []
+    rows: dict[str, list] = {}
+    for s in sessions:
+        rows.setdefault(s["venue"], []).append(
+            {"time": s["time"], "min": s["min"], "max": s["max"], "attrs": s["attrs"]})
     if rows:
         movie["book"] = buy_url
-    return rows
+    return [{"venue": v, "sessions": ss} for v, ss in rows.items()]
+
+
+def bms_seat_url(buy_url: str, venue: str, time_str: str) -> str | None:
+    """Deep link straight to one show's seat layout, or None if it can't be resolved.
+
+    BMS used to answer a showtime click with a "how many seats" dialog; that dialog
+    is gone and the click now just navigates here. Since every part of this URL is
+    data BMS already publishes on the buytickets page, the destination can be built
+    directly — which also sidesteps the seat layout refusing to render inside an
+    automated browser at all."""
+    m = re.search(r"/buytickets/(ET\d+)/(\d{8})", buy_url)
+    if not m:
+        return None
+    event, datecode = m.groups()
+    region, served, sessions = _bms_page(buy_url)
+    if not region or served != datecode:
+        return None
+    vkey = venue.split(":")[0].strip().lower()  # "AAA Cinemas: Ameerpet" -> "aaa cinemas"
+    for s in sessions:
+        if s["time"] != time_str or not (s["venue_code"] and s["session_id"]):
+            continue
+        if vkey and vkey not in s["venue"].lower():
+            continue
+        return (f"https://in.bookmyshow.com/movies/{region.lower()}/seat-layout/"
+                f"{event}/{s['venue_code']}/{s['session_id']}/{datecode}")
+    return None
 
 
 # District calls Delhi-NCR differently from BMS's "ncr" slug
@@ -329,10 +371,49 @@ def _crawl_now(city: str, cache_file: Path) -> str:
     return text
 
 
-def ask_llm(question: str, listings: str, history: list[dict], tools: list | None = None):
+def _read_stream(resp, on_token) -> dict:
+    """streamGenerateContent?alt=sse emits one `data: {...}` line per partial
+    candidate. Collapse them back into exactly the shape generateContent returns,
+    so there stays one response-parsing path below, calling on_token as prose lands."""
+    text, extra = [], {}
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        try:
+            chunk = json.loads(line[5:].strip())
+        except json.JSONDecodeError:
+            continue
+        cand = (chunk.get("candidates") or [{}])[0]
+        for p in (cand.get("content") or {}).get("parts") or []:
+            if "functionCall" in p:
+                extra["functionCall"] = p["functionCall"]
+            elif p.get("text"):
+                text.append(p["text"])
+                on_token(p["text"])
+        if cand.get("finishReason"):
+            extra["finishReason"] = cand["finishReason"]
+        if chunk.get("promptFeedback"):
+            extra["promptFeedback"] = chunk["promptFeedback"]
+    parts = []
+    if "functionCall" in extra:
+        parts.append({"functionCall": extra["functionCall"]})
+    if text:
+        parts.append({"text": "".join(text)})
+    return {"candidates": [{"content": {"parts": parts},
+                            "finishReason": extra.get("finishReason")}],
+            "promptFeedback": extra.get("promptFeedback") or {}}
+
+
+def ask_llm(question: str, listings: str, history: list[dict], tools: list | None = None,
+            on_token=None):
     """Answer grounded in the listings. Returns the reply text — or, when tools are
     offered and the model calls one, the raw functionCall dict, in which case history
-    is left untouched for the caller to record once it knows what actually happened."""
+    is left untouched for the caller to record once it knows what actually happened.
+
+    Pass on_token to stream: it is called with each chunk of text as it arrives, and
+    the full text is still returned at the end. A tool call streams nothing — there
+    is no prose to show, and the caller needs the whole call before it can act."""
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("Set GEMINI_API_KEY (free key: https://aistudio.google.com/apikey)")
@@ -381,13 +462,14 @@ def ask_llm(question: str, listings: str, history: list[dict], tools: list | Non
     # Both are worth trying the other model for; anything else is our own bug and
     # should surface immediately rather than being retried into a vaguer message.
     RETRYABLE = (429, 500, 503)
+    verb = "streamGenerateContent?alt=sse" if on_token else "generateContent"
     for model in ("gemini-flash-latest", "gemini-flash-lite-latest"):  # lite = separate free quota
         req = urllib.request.Request(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:{verb}",
             data=body, headers={"Content-Type": "application/json", "x-goog-api-key": key})
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
-                out = json.load(r)
+                out = _read_stream(r, on_token) if on_token else json.load(r)
             break
         except urllib.error.HTTPError as e:
             if e.code not in RETRYABLE:
