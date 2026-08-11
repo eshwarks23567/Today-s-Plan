@@ -352,6 +352,82 @@ def test_agent_confirms_before_acting():
           not agent._awaiting_confirmation([{"role": "model", "parts": [{"text": "Alpha is at 7:35 PM."}]}]))
 
 
+def test_prefs_concurrency():
+    """summary() reads prefs.json on EVERY request while remember_booking rewrites it.
+    Unlocked, write_text truncates before writing, so a reader lands on zero bytes and
+    raises JSONDecodeError — which took down the whole answer, not just the lookup."""
+    import shutil
+    import tempfile
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
+
+    import prefs
+    real, tmpdir = prefs.PATH, tempfile.mkdtemp()
+    try:
+        prefs.PATH = Path(tmpdir) / "prefs.json"
+        errs = []
+
+        def write(i):
+            try:
+                prefs.remember_booking("hyderabad", f"V{i % 3}", 2)
+            except Exception as e:
+                errs.append(repr(e))
+
+        def read(_):
+            try:
+                prefs.summary()
+            except Exception as e:
+                errs.append(repr(e))
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            jobs = [pool.submit(write, i) for i in range(60)]
+            jobs += [pool.submit(read, i) for i in range(120)]
+            [j.result() for j in jobs]
+        check("concurrent prefs reads never see a truncated file", not errs)
+        check("no booking is lost to the read-modify-write race",
+              sum(prefs.load()["venues"].values()) == 60)
+
+        prefs.PATH.write_text("", encoding="utf-8")
+        check("an empty prefs file loads as defaults instead of raising",
+              prefs.load()["venues"] == {})
+        prefs.PATH.write_text("[1,2,3]", encoding="utf-8")
+        check("a prefs file of the wrong shape loads as defaults",
+              prefs.load()["venues"] == {} and prefs.load()["home_city"] is None)
+    finally:
+        prefs.PATH = real
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_atomic_swap():
+    """Windows refuses to replace a file while any handle has it open, so the snapshot
+    swap failed outright whenever a request was mid-read — and _refresh only logs, so
+    the listings would have stayed stale for the rest of the day."""
+    import shutil
+    import tempfile
+    import threading
+    from pathlib import Path
+
+    d = Path(tempfile.mkdtemp())
+    try:
+        dest, tmp = d / "snap.txt", d / "snap.tmp"
+        dest.write_text("old", encoding="utf-8")
+        tmp.write_text("new", encoding="utf-8")
+        booktic.atomic_swap(tmp, dest)
+        check("atomic_swap replaces the destination", dest.read_text(encoding="utf-8") == "new")
+        check("atomic_swap consumes the temp file", not tmp.exists())
+
+        # a handle held briefly must not lose the swap (a no-op on POSIX, which
+        # replaces happily under an open handle — this is the Windows regression)
+        tmp.write_text("newer", encoding="utf-8")
+        fh = open(dest, encoding="utf-8")
+        threading.Timer(0.15, fh.close).start()
+        booktic.atomic_swap(tmp, dest)
+        check("atomic_swap retries past a reader briefly holding the file",
+              dest.read_text(encoding="utf-8") == "newer")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     real_fetch = booktic.fetch
 
@@ -368,6 +444,7 @@ def main():
     print("ask_llm history"); test_ask_llm_history()
     print("ask_llm tool calls"); test_ask_llm_tool_call()
     print("agent confirmation"); test_agent_confirms_before_acting()
+    print("concurrency"); test_prefs_concurrency(); test_atomic_swap()
 
     booktic.fetch = real_fetch
     if FAILURES:

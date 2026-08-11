@@ -83,6 +83,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     MAX_BODY = 1_000_000  # 1MB is generous for a question + running chat history
+    MAX_QUESTION = 4_000  # a typed question; the longest real one is a sentence or two
+    MAX_TURNS = 200       # ~100 exchanges, far past where the model stops using them
+    MAX_HISTORY_CHARS = 200_000
 
     def do_POST(self):
         if self.path != "/api/ask":
@@ -90,6 +93,16 @@ class Handler(BaseHTTPRequestHandler):
         _limiter.prune()  # a LAN sees a handful of IPs; scanning them beats tracking a timer
         wait = _limiter.check(self.client_address[0])
         if wait:
+            # Drain the body we are never going to parse. Answering while the client
+            # is still sending gets the connection reset instead of delivered, so the
+            # page reports "connection failed" rather than the retry-in-Ns we wrote.
+            # Same reason MAX_BODY drains below; this path just returns sooner.
+            try:
+                pending = min(int(self.headers.get("Content-Length", 0) or 0), self.MAX_BODY)
+                if pending > 0:
+                    self.rfile.read(pending)
+            except (ValueError, OSError):
+                pass
             return self._json(429, {"error": f"Too many requests — try again in {wait}s."},
                               **{"Retry-After": str(wait)})
         try:
@@ -104,12 +117,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.rfile.read(min(length, self.MAX_BODY * 2))
                 raise ValueError("request body too large")
             req = json.loads(self.rfile.read(length))
+            if not isinstance(req, dict):
+                raise ValueError("body must be a JSON object")  # else .get() 500s on a list
             question = req.get("question")
             if not isinstance(question, str) or not question.strip():
                 raise ValueError("missing 'question'")
+            # A 1MB body is within MAX_BODY but is never a real question, and every
+            # byte of it gets billed to the Gemini free tier. Cap the parts that
+            # reach the prompt, generously enough that real use never notices.
+            if len(question) > self.MAX_QUESTION:
+                raise ValueError("'question' is too long")
             history = req.get("history", [])
             if not isinstance(history, list):
                 raise ValueError("'history' must be a list")
+            if len(history) > self.MAX_TURNS:
+                raise ValueError("'history' has too many turns")
             # Shape-check every turn before it reaches Gemini: a malformed history
             # otherwise comes back as an opaque 400 from the API, and history is the
             # one input that arrives wholesale from the client on every request.
@@ -119,7 +141,13 @@ class Handler(BaseHTTPRequestHandler):
                         or not all(isinstance(p, dict) and isinstance(p.get("text"), str)
                                    for p in turn["parts"])):
                     raise ValueError("malformed 'history' turn")
+            if sum(len(p["text"]) for t in history for p in t["parts"]) > self.MAX_HISTORY_CHARS:
+                raise ValueError("'history' is too large")
             city = req.get("city", "hyderabad")
+            # a non-string city is unhashable, and `city not in CITIES` would raise
+            # TypeError rather than the ValueError the 400 path expects
+            if not isinstance(city, str):
+                raise ValueError("'city' must be a string")
             listings = booktic.crawl(city)  # raises ValueError for an unknown city
         except (json.JSONDecodeError, ValueError) as e:
             return self._json(400, {"error": str(e)})
@@ -197,7 +225,26 @@ if __name__ == "__main__":
     # interface hands that to anyone sharing the Wi-Fi. Loopback by default;
     # --lan is the deliberate opt-in for reaching it from your phone.
     lan = "--lan" in sys.argv
-    host = "0.0.0.0" if lan else "127.0.0.1"
+
+    def listener(host: str, family: int) -> ThreadingHTTPServer:
+        cls = type("Server", (ThreadingHTTPServer,),
+                   {"address_family": family, "daemon_threads": True})
+        return cls((host, port), Handler)
+
+    servers = []
+    if lan:
+        servers.append(listener("0.0.0.0", socket.AF_INET))
+    else:
+        # "localhost" resolves to ::1 before 127.0.0.1 on Windows, so an IPv4-only
+        # loopback socket costs every connection ~2s waiting for the fallback — on
+        # the exact URL printed below. Listen on both; keep them loopback so
+        # booking still can't be triggered by anyone else on the network.
+        servers.append(listener("127.0.0.1", socket.AF_INET))
+        try:
+            servers.append(listener("::1", socket.AF_INET6))
+        except OSError:
+            pass  # no IPv6 on this box — 127.0.0.1 alone still serves
+
     threading.Thread(target=_warm, args=(prefs.load().get("home_city") or "hyderabad",),
                      daemon=True).start()
     print(f"Today's Plan running at http://localhost:{port}")
@@ -208,4 +255,6 @@ if __name__ == "__main__":
     else:
         print("  this machine only — pass --lan to reach it from your phone")
     print("(Ctrl+C to stop)")
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+    for extra in servers[1:]:
+        threading.Thread(target=extra.serve_forever, daemon=True).start()
+    servers[0].serve_forever()

@@ -294,6 +294,13 @@ DAYS = 5  # today + next 4: each extra day adds ~10 BMS page fetches per crawl
 _refreshing: set = set()
 _refresh_lock = threading.Lock()  # guards the check-and-set below against two
                                    # requests racing to both spawn a refresh thread
+# Serialises snapshot reads against the swap that replaces them. Every reader is a
+# request thread in THIS process, so taking it around the read means no handle is
+# open when the swap runs — which is what Windows requires. It deliberately does
+# NOT cover the crawl itself: that is ~9s of network, and readers must not block
+# on it. atomic_swap's retry then only has to survive openers we don't control
+# (this project lives in a OneDrive folder, which scans files on its own schedule).
+_snapshot_lock = threading.Lock()
 
 
 def crawl(city: str) -> str:
@@ -308,7 +315,27 @@ def crawl(city: str) -> str:
             if city not in _refreshing:
                 _refreshing.add(city)
                 threading.Thread(target=_refresh, args=(city, cache_file), daemon=True).start()
-    return cache_file.read_text(encoding="utf-8")
+    with _snapshot_lock:  # no reader holds the file open while the swap runs
+        return cache_file.read_text(encoding="utf-8")
+
+
+def atomic_swap(tmp: Path, dest: Path, tries: int = 50) -> None:
+    """Move tmp onto dest, retrying while Windows says the destination is busy.
+
+    POSIX replaces a file out from under an open handle happily. Windows refuses
+    with PermissionError while ANY handle is open, and Python's read path does not
+    ask for FILE_SHARE_DELETE — so a reader that happens to be mid-read fails the
+    swap outright. Since _refresh only logs its failure, one lost race would leave
+    the snapshot stale for the rest of the day. Reads take microseconds, so a short
+    retry wins the race a single attempt loses."""
+    for _ in range(tries):
+        try:
+            os.replace(tmp, dest)
+            return
+        except PermissionError:
+            time.sleep(0.02)
+    tmp.unlink(missing_ok=True)
+    raise RuntimeError(f"could not swap in {dest.name}: the file stayed busy")
 
 
 def crawled_at(city: str) -> float:
@@ -367,7 +394,8 @@ def _crawl_now(city: str, cache_file: Path) -> str:
     text = "\n".join(lines)
     tmp = cache_file.with_suffix(".tmp")  # atomic swap so a reader never sees a half-written file
     tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, cache_file)
+    with _snapshot_lock:
+        atomic_swap(tmp, cache_file)
     return text
 
 
