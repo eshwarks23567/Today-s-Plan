@@ -14,6 +14,7 @@ import io
 import json
 import os
 import sys
+import time
 import urllib.request
 
 import agent
@@ -247,6 +248,23 @@ def test_section():
     ranged = booktic.section(mv, [{"venue": "INOX", "sessions": [{"time": "7:35 PM", "min": 105.0, "max": 249.0}]}])
     check("section formats a price range when min != max", "Rs105-249" in ranged[1])
 
+    # language and format are what people filter on first; the sound-tech tail is not
+    show = lambda t, attrs: {"time": t, "min": 100.0, "max": 100.0, "attrs": attrs}
+    same = booktic.section(mv, [{"venue": "INOX", "sessions": [
+        show("7:35 PM", "Telugu • 2D | DOLBY ATMOS"), show("10:00 PM", "Telugu • 2D | DOLBY ATMOS")]}])
+    check("section keeps language and format", "Telugu 2D" in same[1])
+    check("section drops the sound-tech tail", "DOLBY" not in same[1])
+    check("section hoists a shared format onto the venue, not every showtime",
+          same[1].count("Telugu 2D") == 1 and "INOX [Telugu 2D]" in same[1])
+
+    mixed = booktic.section(mv, [{"venue": "INOX", "sessions": [
+        show("7:35 PM", "Telugu • 2D"), show("10:00 PM", "Hindi • IMAX")]}])
+    check("section annotates per showtime when a venue mixes formats",
+          "[" not in mixed[1] and "Telugu 2D" in mixed[1] and "Hindi IMAX" in mixed[1])
+
+    bare = booktic.section(mv, [{"venue": "INOX", "sessions": [show("7:35 PM", "")]}])
+    check("section adds no brackets when there is no format at all", "[" not in bare[1])
+
 
 def test_ask_llm_history():
     """ask_llm mutates the caller's history list in place, and agent.handle retries
@@ -472,6 +490,64 @@ def test_openai_provider():
         srv.shutdown()
 
 
+def test_provider_stall():
+    """A provider that accepts the connection and never answers is not hypothetical —
+    it is what Gemini did from this machine for hours. It has to come back as a
+    sentence someone can act on, not a raw socket timeout, and not after a minute."""
+    import socket
+    import threading
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    held = []
+
+    def accept_and_stall():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            held.append(conn)  # keep it open, never write a response
+
+    threading.Thread(target=accept_and_stall, daemon=True).start()
+    saved = (booktic.PROVIDER, booktic.LLM_BASE, booktic.LLM_TIMEOUT)
+    booktic.PROVIDER = "openai"
+    booktic.LLM_BASE = "http://127.0.0.1:%d" % srv.getsockname()[1]
+    booktic.LLM_TIMEOUT = 1
+    try:
+        started = time.time()
+        try:
+            booktic.ask_llm("hello?", "L", [])
+            check("a stalled provider raises rather than hanging", False)
+        except RuntimeError as e:
+            check("a stalled provider raises rather than hanging", True)
+            check("the error says the provider did not respond", "did not respond" in str(e))
+            check("it gives up near the timeout, not a minute later", time.time() - started < 15)
+        except Exception as e:
+            check(f"a stalled provider raises RuntimeError, not {type(e).__name__}", False)
+    finally:
+        booktic.PROVIDER, booktic.LLM_BASE, booktic.LLM_TIMEOUT = saved
+        for c in held:
+            c.close()
+        srv.close()
+
+
+def test_error_detail_is_scoped():
+    """Exception text can carry local filesystem paths. On your own machine that
+    detail is the point; once strangers can reach it, it is an information leak."""
+    import server
+    boom = RuntimeError(r"failed reading C:\Users\someone\secret\prefs.json")
+    was = server.HOSTED
+    try:
+        server.HOSTED = False
+        check("locally, the real error reaches you", "prefs.json" in server._safe(boom))
+        server.HOSTED = True
+        check("hosted, the path is not handed to the caller", "prefs.json" not in server._safe(boom))
+    finally:
+        server.HOSTED = was
+
+
 def test_prefs_concurrency():
     """summary() reads prefs.json on EVERY request while remember_booking rewrites it.
     Unlocked, write_text truncates before writing, so a reader lands on zero bytes and
@@ -566,6 +642,7 @@ def main():
     print("agent confirmation"); test_agent_confirms_before_acting()
     print("openai-compatible provider"); test_openai_provider()
     print("booking url allowlist"); test_safe_booking_url()
+    print("provider resilience"); test_provider_stall(); test_error_detail_is_scoped()
     print("concurrency"); test_prefs_concurrency(); test_atomic_swap()
 
     booktic.fetch = real_fetch

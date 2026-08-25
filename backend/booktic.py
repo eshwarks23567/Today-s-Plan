@@ -65,6 +65,10 @@ def posters(city: str) -> list[str]:
     _check_city(city)
     key = (city, date.today())
     if key not in _posters:
+        # keyed by day, so yesterday's entries are dead weight — drop them rather
+        # than growing one entry per city per day for as long as the process lives
+        for stale in [k for k in _posters if k[1] != key[1]]:
+            _posters.pop(stale, None)
         dcity = DISTRICT_CITY.get(city, city)
         try:
             movies = [m["image"] for m in
@@ -284,13 +288,32 @@ def bms_events(city: str) -> list[str]:
 
 
 def section(mv: dict, rows: list[dict]) -> list[str]:
+    """One block per movie. Language and format go in because in India they are the
+    first filter most people apply — "any Telugu shows after 9?" is unanswerable
+    without them, and they were being parsed and then dropped here."""
     lines = [f"\n## {mv['title']}  — book: {mv['book']}"]
     for r in rows:
-        shows = ", ".join(
-            f"{s['time']} Rs{s['min']:.0f}" + (f"-{s['max']:.0f}" if s["max"] > s["min"] else "")
-            for s in r["sessions"])
-        lines.append(f"- {r['venue']}: {shows}")
+        # A venue almost always runs one movie in a single language and format, so
+        # repeating it on every showtime is the same few words 1,100 times over —
+        # ~2,000 tokens per request. Hoist it to the venue when it is shared, and
+        # only annotate per showtime when a venue genuinely mixes them.
+        formats = {_session_format(s) for s in r["sessions"]}
+        shared = formats.pop() if len(formats) == 1 else ""
+        shows = []
+        for s in r["sessions"]:
+            price = f"Rs{s['min']:.0f}" + (f"-{s['max']:.0f}" if s["max"] > s["min"] else "")
+            fmt = "" if shared else _session_format(s)
+            shows.append(f"{s['time']} {price}" + (f" {fmt}" if fmt else ""))
+        venue = f"{r['venue']} [{shared}]" if shared else r["venue"]
+        lines.append(f"- {venue}: {', '.join(shows)}")
     return lines
+
+
+def _session_format(s: dict) -> str:
+    """'English • 2D | LASER DOLBY ATMOS' -> 'English 2D'. The sound-tech tail costs
+    tokens on every request and nobody filters a cinema search on Dolby."""
+    fmt = (s.get("attrs") or "").split("|")[0].replace("•", " ").strip()
+    return re.sub(r"\s{2,}", " ", fmt)
 
 
 # Today's showtimes sell out and shift; Friday's 8pm show is still Friday's 8pm
@@ -480,6 +503,10 @@ def _read_stream(resp, on_token) -> dict:
 PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
 LLM_BASE = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+# Applies per socket read, so it bounds a stalled provider rather than the whole
+# answer — streaming keeps resetting it. A minute of dead air is not worth waiting
+# through when the message at the end is only going to say "it did not respond".
+LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", 45))
 
 
 def _openai_tools(tools: list | None) -> list:
@@ -567,15 +594,16 @@ def _ask_openai(system: str, history: list[dict], question: str, tools, on_token
     req = urllib.request.Request(f"{LLM_BASE}/chat/completions",
                                  data=json.dumps(payload).encode(), headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=90) as r:
+        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
             if on_token:
                 return _read_openai_stream(r, on_token)
             out = json.load(r)
     except urllib.error.HTTPError as e:
         detail = e.read()[:300].decode("utf-8", "replace")
         raise RuntimeError(f"{LLM_MODEL} at {LLM_BASE} returned HTTP {e.code}: {detail}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Could not reach {LLM_BASE} ({e.reason}). Is it running?")
+    except (TimeoutError, urllib.error.URLError, OSError) as e:
+        raise RuntimeError(f"{LLM_BASE} did not respond within {LLM_TIMEOUT}s "
+                           f"({getattr(e, 'reason', e)}). Is it running and reachable?")
     return _openai_result((out.get("choices") or [{}])[0].get("message") or {})
 
 
@@ -588,7 +616,7 @@ def _ask_gemini(system: str, history: list[dict], question: str, tools, on_token
     if tools:
         payload["tools"] = tools
     body = json.dumps(payload).encode()
-    out, last = None, None
+    out, last, stalled = None, None, False
     # 429 = this model's free quota is spent, 500/503 = Gemini itself is wobbling.
     # Both are worth trying the other model for; anything else is our own bug and
     # should surface immediately rather than being retried into a vaguer message.
@@ -599,14 +627,24 @@ def _ask_gemini(system: str, history: list[dict], question: str, tools, on_token
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:{verb}",
             data=body, headers={"Content-Type": "application/json", "x-goog-api-key": key})
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
                 out = _read_stream(r, on_token) if on_token else json.load(r)
             break
         except urllib.error.HTTPError as e:
             if e.code not in RETRYABLE:
                 raise
             last = e.code
+        except (TimeoutError, urllib.error.URLError, OSError):
+            # Not the same as an error response: the request went out and nothing
+            # came back. Trying the second model would just cost another wait, so
+            # stop and say what actually happened.
+            stalled = True
+            break
     if out is None:
+        if stalled:
+            raise RuntimeError(f"Gemini did not respond within {LLM_TIMEOUT}s. It may be down, or "
+                               "this network may be blocked — set LLM_PROVIDER=openai to use an "
+                               "open-weight model instead.")
         raise RuntimeError("Gemini free-tier quota exhausted on both models — try again in a minute."
                            if last == 429 else
                            f"Gemini is unavailable right now (HTTP {last}) — try again in a moment.")

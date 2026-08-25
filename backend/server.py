@@ -32,6 +32,13 @@ TYPES = {".html": "text/html", ".css": "text/css", ".js": "text/javascript",
 
 HOSTED = bool(os.environ.get("PORT"))
 
+CSP = ("default-src 'self'; "
+       "script-src 'self' https://cdnjs.cloudflare.com; "
+       "style-src 'self' 'unsafe-inline'; "   # the hero animation sets style attributes
+       "img-src 'self' data: https:; "        # posters are served from several CDNs
+       "connect-src 'self'; font-src 'self'; "
+       "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+
 # every /api/ask spends Gemini free-tier quota, so one runaway tab or a stuck
 # retry loop can burn the day's budget in a minute — 20/min is far above what a
 # person types and far below what a loop does
@@ -55,8 +62,15 @@ def client_ip(handler) -> str:
     return handler.client_address[0]
 
 
-def _log_error():  # full traceback server-side; the client only sees str(e)
+def _log_error():  # full traceback server-side; the client sees only what _safe says
     traceback.print_exc(file=sys.stderr)
+
+
+def _safe(e: Exception) -> str:
+    """What a 500 is allowed to tell the caller. Exception text here can carry local
+    filesystem paths, so on a shared host it is replaced by something generic — but
+    on your own machine the detail is the whole point of reading the error."""
+    return "Something went wrong on the server." if HOSTED else str(e)
 
 
 def lan_ip() -> str:
@@ -88,7 +102,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": str(e)})
             except Exception as e:
                 _log_error()
-                return self._json(500, {"error": str(e)})
+                return self._json(500, {"error": _safe(e)})
         name = "index.html" if self.path == "/" else self.path.lstrip("/")
         # Resolve to a canonical absolute path and verify it's still inside FRONTEND,
         # rather than blacklisting "/" and "..": a bare leading backslash (no slash,
@@ -104,6 +118,12 @@ class Handler(BaseHTTPRequestHandler):
         body = file.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", f"{TYPES[file.suffix]}; charset=utf-8")
+        if file.suffix == ".html":
+            # Defence in depth behind the escaping in md(): even an injected tag
+            # could not load a script from anywhere but here, and there are no
+            # inline <script> blocks to allow. Posters come from arbitrary CDNs,
+            # so img-src stays broad; nothing else needs to reach off-origin.
+            self.send_header("Content-Security-Policy", CSP)
         # this app is under active iteration — a stale cached app.js/style.css
         # showing an already-fixed bug wastes more time than never caching does
         self.send_header("Cache-Control", "no-store")
@@ -187,7 +207,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": str(e)})
         except Exception as e:
             _log_error()
-            return self._json(500, {"error": str(e)})
+            return self._json(500, {"error": _safe(e)})
 
         # Everything above could still choose a status code. From here the answer
         # streams, so the 200 is already committed and a later failure has to arrive
@@ -221,7 +241,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             _log_error()
             try:
-                send(type="error", error=str(e))
+                send(type="error", error=_safe(e))
             except (BrokenPipeError, ConnectionError):
                 pass
 

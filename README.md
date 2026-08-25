@@ -8,6 +8,7 @@ Built to cost nothing to run: no paid APIs, browser-native voice, free-tier LLM,
 
 - **Voice in, voice out** — browser-native speech recognition and TTS, with a live transcript while you speak
 - **Streaming answers** — replies appear as they are generated, so a long comparison starts reading in 2–4s instead of landing all at once after 15+
+- **Language and format** — every showtime carries its language and screen format, so "any Telugu shows after 9?" is answerable
 - **Two ticket sellers compared** — the same cinema often prices differently on BookMyShow vs District; the agent calls out which is cheaper
 - **5-day showtime window** — today plus the next four days. Today refreshes every ~20 minutes; later dates hourly, because Friday's 8pm show is still Friday's 8pm show an hour later
 - **Events & concerts** — gigs, standup, workshops with dates and starting prices
@@ -141,6 +142,7 @@ dependencies; dropping Playwright for a deep link removed the last one.
 | dead air removed by streaming | **12.8–19.3s** |
 | LLM calls per booking turn | 1 (was 2) |
 | prompt carried per turn | ~13,000 tokens of listings |
+| language/format annotation | 3,900 chars (11,300 before hoisting it per venue) |
 
 Time-to-first-token is roughly flat regardless of answer length — that is the model
 reading the listings. Everything after it streams, so the longer the answer, the
