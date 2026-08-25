@@ -9,10 +9,11 @@ Built to cost nothing to run: no paid APIs, browser-native voice, free-tier LLM,
 - **Voice in, voice out** — browser-native speech recognition and TTS, with a live transcript while you speak
 - **Streaming answers** — replies appear as they are generated, so a long comparison starts reading in 2–4s instead of landing all at once after 15+
 - **Two ticket sellers compared** — the same cinema often prices differently on BookMyShow vs District; the agent calls out which is cheaper
-- **5-day showtime window** — today plus the next four days, refreshed in the background every ~20 minutes
+- **5-day showtime window** — today plus the next four days. Today refreshes every ~20 minutes; later dates hourly, because Friday's 8pm show is still Friday's 8pm show an hour later
 - **Events & concerts** — gigs, standup, workshops with dates and starting prices
 - **One-hop booking** — say *"book 2 tickets for Alpha at INOX Odeon 07:35 PM"* and it resolves that exact show to its seat-map URL and opens it. It asks first whenever it had to infer the venue, time or party size rather than being told.
 - **Grounded answers only** — the model answers strictly from crawled listings, and every recommendation carries its booking link
+- **Bring your own model** — Gemini by default, or any open-weight model via Groq, OpenRouter or a local Ollama; see [Choosing a model](#choosing-a-model)
 - **Persistent chats** — past conversations and their context survive refreshes, with per-chat delete
 - **7 cities** — Hyderabad, Bengaluru, Mumbai, Delhi NCR, Chennai, Pune, Kolkata
 
@@ -40,6 +41,33 @@ python backend/server.py --lan     # anyone on your Wi-Fi, no login
 booking returns a tappable link instead of opening a browser on the host — the
 server is not the device you are holding.
 
+## Choosing a model
+
+Gemini's free tier is the default. Any open-weight model works too — Groq,
+OpenRouter, Together and a local Ollama or llama.cpp server all speak the OpenAI
+chat-completions shape, so one adapter covers all of them:
+
+```powershell
+# open weights, hosted (Groq's free tier is fast and generous)
+$env:LLM_PROVIDER = "openai"
+$env:LLM_API_KEY  = "gsk_..."
+$env:LLM_MODEL    = "llama-3.3-70b-versatile"
+
+# open weights, entirely on your own machine — no key, no vendor, no quota
+$env:LLM_PROVIDER = "openai"
+$env:LLM_BASE_URL = "http://localhost:11434/v1"   # ollama serve
+$env:LLM_MODEL    = "llama3.2"
+```
+
+The server prints which model it is using at startup. `LLM_BASE_URL` defaults to
+Groq; `LLM_API_KEY` is optional, because a local server does not want one.
+
+Two things the model must support, whichever you pick: **streaming**, or answers
+arrive all at once after fifteen seconds, and **tool calling**, or booking stops
+working and every request becomes a chat reply. Most instruction-tuned open models
+above ~8B handle both; very small ones tend to answer *about* the tool instead of
+calling it.
+
 The core Q&A also works as a plain terminal chat:
 
 ```powershell
@@ -56,14 +84,16 @@ Browser (voice + chat UI)
 server.py (stdlib HTTP)
         │
         ▼
-agent.py ── one Gemini call, with a `book` tool declared
+agent.py ── one LLM call, with a `book` tool declared
+        │            (Gemini, or any OpenAI-compatible open-weight model)
         │
         ├── plain answer  → streamed to the page token by token
         └── tool call     → resolve the exact show's seat-map URL,
                             confirm if anything was inferred, then open it
         ▲
-booktic.crawl — 20-min snapshots of:
-BookMyShow movies (5 days) · District movies · BMS events
+booktic.crawl — two snapshots on two clocks:
+  today  (~20 min): BMS today · District · events
+  future (hourly) : BMS tomorrow..+4
 ```
 
 There is no planner, router or agent framework. One model call reads the listings,
@@ -131,7 +161,9 @@ Windows, and the server was listening on IPv4 only, so every connection paid a
 
 | | |
 |---|---|
-| full crawl | 73 fetches in **5s** |
+| cold crawl, both parts | 74 fetches in **5s** |
+| routine refresh (today only) | **22 fetches** |
+| fetches per hour, one city | 219 → **118** |
 | listings snapshot | 52,000 chars across 7 sections, 5 days |
 | BookMyShow coverage, one city | ~150 venues / ~240 sessions today |
 | booking, question → seat map open | **4.7s** (was ~60s of browser driving, and broken) |

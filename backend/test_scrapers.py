@@ -383,6 +383,95 @@ def _raises(fn) -> bool:
     return False
 
 
+def _fake_openai_server(responses):
+    """A minimal OpenAI-compatible endpoint on a loopback port, so the adapter gets
+    tested against the real wire format without a key, a vendor or a network."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    seen = []
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            seen.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)))))
+            body, stream = responses.pop(0)
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "text/event-stream" if stream else "application/json")
+            self.end_headers()
+            if stream:
+                for frame in body:
+                    self.wfile.write(b"data: " + json.dumps(frame).encode() + b"\n\n")
+                self.wfile.write(b"data: [DONE]\n\n")
+            else:
+                self.wfile.write(json.dumps(body).encode())
+            self.wfile.flush()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, seen
+
+
+def test_openai_provider():
+    """Every open-weight host worth using speaks the OpenAI chat shape, so this one
+    adapter covers Groq, OpenRouter, Together and a local Ollama alike. What has to
+    hold is that agent.py cannot tell which provider answered."""
+    text_reply = {"choices": [{"message": {"role": "assistant", "content": "Two films tonight."}}]}
+    tool_reply = {"choices": [{"message": {"tool_calls": [
+        {"function": {"name": "book", "arguments": '{"movie": "Alpha", "seats": 3}'}}]}}]}
+    stream_text = [{"choices": [{"delta": {"content": c}}]}
+                   for c in ("Two ", "films ", "tonight.")]
+    # a real stream splits the arguments JSON across frames — reassembling it is
+    # the whole reason this path is not just "read delta.content"
+    stream_tool = [
+        {"choices": [{"delta": {"tool_calls": [
+            {"function": {"name": "book", "arguments": '{"mov'}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"function": {"arguments": 'ie": "Alpha"}'}}]}}]},
+    ]
+    srv, seen = _fake_openai_server([(text_reply, False), (stream_text, True),
+                                     (tool_reply, False), (stream_tool, True)])
+    host, port = srv.server_address
+    saved = (booktic.PROVIDER, booktic.LLM_BASE, booktic.LLM_MODEL)
+    booktic.PROVIDER = "openai"
+    booktic.LLM_BASE = f"http://{host}:{port}"
+    booktic.LLM_MODEL = "some-open-model"
+    try:
+        h = []
+        out = booktic.ask_llm("what is on?", "LISTINGS", h, tools=[agent.BOOK_TOOL])
+        check("openai: a plain reply comes back as text", out == "Two films tonight.")
+        check("openai: history records the turn", [t["role"] for t in h] == ["user", "model"])
+        sent = seen[0]
+        check("openai: the system prompt leads the messages",
+              sent["messages"][0]["role"] == "system" and "LISTINGS" in sent["messages"][0]["content"])
+        check("openai: the model name is sent", sent["model"] == "some-open-model")
+        check("openai: the book tool is translated, not dropped",
+              sent["tools"][0]["function"]["name"] == "book"
+              and "book_url" in sent["tools"][0]["function"]["parameters"]["properties"])
+
+        got = []
+        out = booktic.ask_llm("again?", "L", h, on_token=got.append)
+        check("openai: streaming yields tokens as they arrive",
+              got == ["Two ", "films ", "tonight."])
+        check("openai: streaming still returns the whole answer", out == "Two films tonight.")
+
+        h2 = []
+        call = booktic.ask_llm("book it", "L", h2, tools=[agent.BOOK_TOOL])
+        check("openai: a tool call arrives in the same shape Gemini's does",
+              isinstance(call, dict) and call.get("name") == "book"
+              and (call.get("args") or {}).get("seats") == 3)
+        check("openai: a tool call leaves history for the caller", h2 == [])
+
+        call = booktic.ask_llm("book it", "L", h2, tools=[agent.BOOK_TOOL], on_token=lambda t: None)
+        check("openai: streamed tool arguments are reassembled across frames",
+              isinstance(call, dict) and call.get("args") == {"movie": "Alpha"})
+    finally:
+        booktic.PROVIDER, booktic.LLM_BASE, booktic.LLM_MODEL = saved
+        srv.shutdown()
+
+
 def test_prefs_concurrency():
     """summary() reads prefs.json on EVERY request while remember_booking rewrites it.
     Unlocked, write_text truncates before writing, so a reader lands on zero bytes and
@@ -475,6 +564,7 @@ def main():
     print("ask_llm history"); test_ask_llm_history()
     print("ask_llm tool calls"); test_ask_llm_tool_call()
     print("agent confirmation"); test_agent_confirms_before_acting()
+    print("openai-compatible provider"); test_openai_provider()
     print("booking url allowlist"); test_safe_booking_url()
     print("concurrency"); test_prefs_concurrency(); test_atomic_swap()
 

@@ -285,7 +285,10 @@ if __name__ == "__main__":
 
     threading.Thread(target=_warm, args=(prefs.load().get("home_city") or "hyderabad",),
                      daemon=True).start()
+    model = ("Gemini (gemini-flash-latest)" if booktic.PROVIDER == "gemini"
+             else f"{booktic.LLM_MODEL} via {booktic.LLM_BASE}")
     print(f"Today's Plan running at http://localhost:{port}")
+    print(f"  model: {model}")
     if lan:
         print(f"On your phone (same Wi-Fi): http://{lan_ip()}:{port}")
         print("  ! open to everyone on this network, with no login — booking opens browser")

@@ -472,55 +472,119 @@ def _read_stream(resp, on_token) -> dict:
             "promptFeedback": extra.get("promptFeedback") or {}}
 
 
-def ask_llm(question: str, listings: str, history: list[dict], tools: list | None = None,
-            on_token=None):
-    """Answer grounded in the listings. Returns the reply text — or, when tools are
-    offered and the model calls one, the raw functionCall dict, in which case history
-    is left untouched for the caller to record once it knows what actually happened.
+# Which model answers. "gemini" is the default; anything else is spoken to over the
+# OpenAI chat-completions shape, which is the lingua franca of open-weight hosting —
+# Groq, OpenRouter, Together, and a local Ollama or llama.cpp server all implement
+# it. So one extra code path buys every open-source option, cloud or on your own
+# machine, rather than one integration per vendor.
+PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
+LLM_BASE = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
 
-    Pass on_token to stream: it is called with each chunk of text as it arrives, and
-    the full text is still returned at the end. A tool call streams nothing — there
-    is no prose to show, and the caller needs the whole call before it can act."""
+
+def _openai_tools(tools: list | None) -> list:
+    """Gemini declares tools as function_declarations; OpenAI wraps each one in
+    {"type": "function", ...}. The JSON Schema in `parameters` is identical, which
+    is why one tool definition serves both."""
+    out = []
+    for t in tools or []:
+        for fn in t.get("function_declarations", []):
+            out.append({"type": "function", "function": {
+                "name": fn["name"],
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {})}})
+    return out
+
+
+def _openai_messages(system: str, history: list[dict], question: str) -> list[dict]:
+    """History is stored in Gemini's shape (it is what the browser saves), so it is
+    translated on the way out rather than migrating everyone's saved chats."""
+    msgs = [{"role": "system", "content": system}]
+    for turn in history:
+        text = "".join(p.get("text", "") for p in turn.get("parts", []))
+        msgs.append({"role": "assistant" if turn.get("role") == "model" else "user",
+                     "content": text})
+    msgs.append({"role": "user", "content": question})
+    return msgs
+
+
+def _openai_result(message: dict):
+    """Reply text, or the same {"name", "args"} shape ask_llm returns for Gemini —
+    so agent.py never learns which provider answered."""
+    calls = message.get("tool_calls") or []
+    if calls:
+        fn = calls[0].get("function") or {}
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        return {"name": fn.get("name", ""), "args": args}
+    return message.get("content") or ""
+
+
+def _read_openai_stream(resp, on_token):
+    """Same job as _read_stream, different wire format: content arrives as
+    delta.content, and a tool call's arguments arrive as a JSON string in
+    fragments that have to be concatenated before they parse."""
+    text, call_name, call_args = [], "", []
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        delta = ((chunk.get("choices") or [{}])[0].get("delta")) or {}
+        for tc in delta.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                call_name = fn["name"]
+            if fn.get("arguments"):
+                call_args.append(fn["arguments"])
+        piece = delta.get("content")
+        if piece:
+            text.append(piece)
+            on_token(piece)
+    return _openai_result({"content": "".join(text)} if not call_name else
+                          {"tool_calls": [{"function": {"name": call_name,
+                                                        "arguments": "".join(call_args)}}]})
+
+
+def _ask_openai(system: str, history: list[dict], question: str, tools, on_token):
+    key = os.environ.get("LLM_API_KEY", "")
+    payload = {"model": LLM_MODEL, "messages": _openai_messages(system, history, question)}
+    if tools:
+        payload["tools"] = _openai_tools(tools)
+    if on_token:
+        payload["stream"] = True
+    headers = {"Content-Type": "application/json"}
+    if key:  # a local Ollama or llama.cpp server needs no key at all
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(f"{LLM_BASE}/chat/completions",
+                                 data=json.dumps(payload).encode(), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            if on_token:
+                return _read_openai_stream(r, on_token)
+            out = json.load(r)
+    except urllib.error.HTTPError as e:
+        detail = e.read()[:300].decode("utf-8", "replace")
+        raise RuntimeError(f"{LLM_MODEL} at {LLM_BASE} returned HTTP {e.code}: {detail}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Could not reach {LLM_BASE} ({e.reason}). Is it running?")
+    return _openai_result((out.get("choices") or [{}])[0].get("message") or {})
+
+
+def _ask_gemini(system: str, history: list[dict], question: str, tools, on_token):
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("Set GEMINI_API_KEY (free key: https://aistudio.google.com/apikey)")
-    import prefs
-    pref_line = prefs.summary()
-    system = (
-        "You are BookTic, a movie-ticket assistant. Answer ONLY from the listings below - never invent "
-        "movies, venues, times or prices. Prices are per-ticket in INR (Rs). When asked for cheapest, "
-        "compare across ALL venues AND both sources (BookMyShow and District sell tickets for the same "
-        "cinemas at sometimes different prices - point out when one is cheaper). State tradeoffs "
-        "(e.g. cheapest is a morning show). Include the booking link of whichever source you recommend "
-        "- each date section has its own booking links, so use the link from the date the user wants. "
-        "Movie showtimes cover the dates shown in the section headings; for dates beyond them, say "
-        "you only see that far ahead. The events/concerts section lists upcoming events with their "
-        f"own dates. Today is {date.today().isoformat()}."
-        + (f"\n\n{pref_line}" if pref_line else "")
-    )
-    if tools:
-        # These rules used to live in a separate planner prompt. Folded in here, the
-        # one model that reads the listings and its own earlier replies is also the
-        # one deciding to act — so "the second one" resolves against what it actually
-        # said, instead of against a six-message excerpt handed to a second call.
-        system += (
-            "\n\nYou can also open the user's browser on a specific show by calling the book "
-            "tool. Call it ONLY when they ask to book, select or open tickets now — not when "
-            "they are asking about showtimes. Never invent a venue or a showtime: fill those "
-            "only when the user named them, said 'my usual place' and a preferred venue is "
-            "known, or the conversation makes them unambiguous. Copy venue, time and book_url "
-            "verbatim from the listings. List in `inferred` every field you filled from context "
-            "or your own suggestion rather than from the user's own words this turn — but leave "
-            "it empty when they are simply confirming a plan you already proposed."
-        )
-    system += f"\n\n{listings}"
-    # build the turn without mutating history yet: if the call fails, the caller
-    # retries with the SAME list, and a pre-appended question would be sent twice
-    # (Gemini then sees two consecutive user turns, and the client saves that
-    # malformed history to localStorage for good)
-    msg = {"role": "user", "parts": [{"text": question}]}
     payload = {"system_instruction": {"parts": [{"text": system}]},
-               "contents": history + [msg]}
+               "contents": history + [{"role": "user", "parts": [{"text": question}]}]}
     if tools:
         payload["tools"] = tools
     body = json.dumps(payload).encode()
@@ -553,13 +617,68 @@ def ask_llm(question: str, listings: str, history: list[dict], tools: list | Non
     parts = (candidates[0].get("content") or {}).get("parts") or []
     for p in parts:
         if "functionCall" in p:
-            return p["functionCall"]  # caller records the turn once it knows the outcome
+            return p["functionCall"]
     answer = "".join(p.get("text", "") for p in parts)
     if not answer.strip():
         raise RuntimeError(f"Gemini returned an empty answer ({candidates[0].get('finishReason')})")
-    history.append(msg)
-    history.append({"role": "model", "parts": [{"text": answer}]})
     return answer
+
+
+def ask_llm(question: str, listings: str, history: list[dict], tools: list | None = None,
+            on_token=None):
+    """Answer grounded in the listings. Returns the reply text — or, when tools are
+    offered and the model calls one, a {"name", "args"} dict, in which case history
+    is left untouched for the caller to record once it knows what actually happened.
+
+    Pass on_token to stream: it is called with each chunk of text as it arrives, and
+    the full text is still returned at the end. A tool call streams nothing — there
+    is no prose to show, and the caller needs the whole call before it can act.
+
+    Which provider answers is decided by PROVIDER; both return the same two shapes,
+    so nothing above this function knows or cares."""
+    import prefs
+    pref_line = prefs.summary()
+    system = (
+        "You are BookTic, a movie-ticket assistant. Answer ONLY from the listings below - never invent "
+        "movies, venues, times or prices. Prices are per-ticket in INR (Rs). When asked for cheapest, "
+        "compare across ALL venues AND both sources (BookMyShow and District sell tickets for the same "
+        "cinemas at sometimes different prices - point out when one is cheaper). State tradeoffs "
+        "(e.g. cheapest is a morning show). Include the booking link of whichever source you recommend "
+        "- each date section has its own booking links, so use the link from the date the user wants. "
+        "Movie showtimes cover the dates shown in the section headings; for dates beyond them, say "
+        "you only see that far ahead. The events/concerts section lists upcoming events with their "
+        f"own dates. Today is {date.today().isoformat()}."
+        + (f"\n\n{pref_line}" if pref_line else "")
+    )
+    if tools:
+        # These rules used to live in a separate planner prompt. Folded in here, the
+        # one model that reads the listings and its own earlier replies is also the
+        # one deciding to act — so "the second one" resolves against what it actually
+        # said, instead of against a six-message excerpt handed to a second call.
+        system += (
+            "\n\nYou can also open the user's browser on a specific show by calling the book "
+            "tool. Call it ONLY when they ask to book, select or open tickets now — not when "
+            "they are asking about showtimes. Never invent a venue or a showtime: fill those "
+            "only when the user named them, said 'my usual place' and a preferred venue is "
+            "known, or the conversation makes them unambiguous. Copy venue, time and book_url "
+            "verbatim from the listings. List in `inferred` every field you filled from context "
+            "or your own suggestion rather than from the user's own words this turn — but leave "
+            "it empty when they are simply confirming a plan you already proposed."
+        )
+    system += f"\n\n{listings}"
+
+    ask = _ask_gemini if PROVIDER == "gemini" else _ask_openai
+    out = ask(system, history, question, tools, on_token)
+    if isinstance(out, dict):
+        return out  # a tool call: the caller records the turn once it knows the outcome
+    if not out.strip():
+        raise RuntimeError(f"{PROVIDER} returned an empty answer")
+    # Only now is history touched. If the call above raised, the caller retries with
+    # the SAME list, and a pre-appended question would be sent twice — two consecutive
+    # user turns, saved to the browser's localStorage for good.
+    history.append({"role": "user", "parts": [{"text": question}]})
+    history.append({"role": "model", "parts": [{"text": out}]})
+    return out
 
 
 def main():
