@@ -1,9 +1,18 @@
 """BookTic web app — stdlib HTTP server wrapping booktic.py.
 
-    python server.py [port]     # then open http://localhost:8765, or from a
-                                 # phone on the same Wi-Fi: http://<lan-ip>:8765
+    python server.py [port]         # http://localhost:8765, this machine only
+    python server.py --lan          # also reachable from your Wi-Fi
+    PORT=8080 python server.py      # hosted mode (see HOSTED below)
+
+Setting $PORT is how every PaaS starts a process, so it doubles as the signal
+that this is a shared box on the public internet rather than someone's laptop.
+That one flag changes three things: bind every interface, trust the proxy's
+X-Forwarded-For for rate limiting, and stop learning preferences — prefs.json
+is a single global file, so on a shared host it would blend every visitor's
+venues together and feed them back to each other.
 """
 import json
+import os
 import socket
 import sys
 import threading
@@ -21,10 +30,29 @@ TYPES = {".html": "text/html", ".css": "text/css", ".js": "text/javascript",
          ".json": "application/manifest+json", ".svg": "image/svg+xml",
          ".woff2": "font/woff2"}
 
+HOSTED = bool(os.environ.get("PORT"))
+
 # every /api/ask spends Gemini free-tier quota, so one runaway tab or a stuck
 # retry loop can burn the day's budget in a minute — 20/min is far above what a
 # person types and far below what a loop does
-_limiter = ratelimit.RateLimiter(20)
+_limiter = ratelimit.RateLimiter(int(os.environ.get("RATE_PER_MIN", 20)))
+# The burst limit does nothing against steady use: the free tier is ~1500
+# requests a day TOTAL across everyone, so one enthusiastic visitor can spend it
+# all inside the per-minute cap. The daily cap is what actually protects the key.
+_daily = ratelimit.RateLimiter(int(os.environ.get("RATE_PER_DAY", 60)), 86_400)
+
+
+def client_ip(handler) -> str:
+    """Who to rate-limit. Behind a proxy every connection arrives from the load
+    balancer, so limiting on the socket address would put every visitor in ONE
+    bucket. Only trust the forwarded header when we know we are behind a proxy —
+    otherwise anyone could set it and get a fresh bucket per request."""
+    if HOSTED:
+        for header in ("CF-Connecting-IP", "X-Real-IP", "X-Forwarded-For"):
+            value = handler.headers.get(header)
+            if value:
+                return value.split(",")[0].strip()  # leftmost = original client
+    return handler.client_address[0]
 
 
 def _log_error():  # full traceback server-side; the client only sees str(e)
@@ -91,7 +119,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/api/ask":
             return self.send_error(404)
         _limiter.prune()  # a LAN sees a handful of IPs; scanning them beats tracking a timer
-        wait = _limiter.check(self.client_address[0])
+        who = client_ip(self)
+        burst = _limiter.check(who)
+        # only count against the day's allowance if the burst limit let it through,
+        # or one runaway tab would spend a visitor's whole day in a few seconds
+        wait = burst or _daily.check(who)
         if wait:
             # Drain the body we are never going to parse. Answering while the client
             # is still sending gets the connection reset instead of delivered, so the
@@ -103,8 +135,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.rfile.read(pending)
             except (ValueError, OSError):
                 pass
-            return self._json(429, {"error": f"Too many requests — try again in {wait}s."},
-                              **{"Retry-After": str(wait)})
+            note = (f"Too many requests — try again in {wait}s." if burst else
+                    "That's today's limit for this demo, so the shared API key survives "
+                    "until tomorrow. Try again in the morning.")
+            return self._json(429, {"error": note}, **{"Retry-After": str(wait)})
         try:
             length = int(self.headers.get("Content-Length", 0))
             if length <= 0:
@@ -172,8 +206,8 @@ class Handler(BaseHTTPRequestHandler):
         # opening a browser here would pop a window on a desktop nobody is looking
         # at. Any proxy header means the request came from somewhere else; then the
         # link travels back and the page offers it as a button instead.
-        remote = any(self.headers.get(h) for h in
-                     ("CF-Ray", "CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"))
+        remote = HOSTED or any(self.headers.get(h) for h in
+                               ("CF-Ray", "CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"))
         try:
             answer, booked, url = agent.handle(
                 question, history, listings, city,
@@ -220,7 +254,8 @@ if __name__ == "__main__":
     # UnicodeEncodeError inside the request thread and turns an answer into a 500
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     args = [a for a in sys.argv[1:] if a != "--lan"]
-    port = int(args[0]) if args else 8765
+    port = int(os.environ.get("PORT") or (args[0] if args else 8765))
+    prefs.ENABLED = not HOSTED  # one global prefs file must not learn from strangers
     # Booking opens a browser window on THIS machine, so listening on every
     # interface hands that to anyone sharing the Wi-Fi. Loopback by default;
     # --lan is the deliberate opt-in for reaching it from your phone.
@@ -232,7 +267,10 @@ if __name__ == "__main__":
         return cls((host, port), Handler)
 
     servers = []
-    if lan:
+    if HOSTED:
+        # the platform terminates TLS and forwards; bind everything it can reach
+        servers.append(listener("0.0.0.0", socket.AF_INET))
+    elif lan:
         servers.append(listener("0.0.0.0", socket.AF_INET))
     else:
         # "localhost" resolves to ::1 before 127.0.0.1 on Windows, so an IPv4-only

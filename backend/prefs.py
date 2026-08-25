@@ -17,6 +17,11 @@ from pathlib import Path
 PATH = Path(__file__).parent / "prefs.json"
 _lock = threading.RLock()
 
+# Turned off on a shared host: this is ONE file, so on a public deployment it
+# would blend every visitor's venues into a single profile and then feed that
+# back to all of them. Personal machine only — server.py sets it.
+ENABLED = True
+
 
 def load() -> dict:
     """Never raises. Preferences are a nicety; a missing or half-written file must
@@ -36,6 +41,8 @@ def load() -> dict:
 
 
 def remember_booking(city: str, venue: str | None, seats: int | None = None) -> None:
+    if not ENABLED:
+        return
     with _lock:
         p = load()
         p["home_city"] = p.get("home_city") or city
@@ -50,6 +57,8 @@ def remember_booking(city: str, venue: str | None, seats: int | None = None) -> 
 
 def summary() -> str:
     """One line for a system prompt; empty until something has actually been learned."""
+    if not ENABLED:
+        return ""
     p = load()
     bits = []
     if p.get("venues"):

@@ -293,34 +293,124 @@ def section(mv: dict, rows: list[dict]) -> list[str]:
     return lines
 
 
-CRAWL_TTL = 20 * 60  # seconds — listings older than this refresh in the background
-DAYS = 5  # today + next 4: each extra day adds ~10 BMS page fetches per crawl
-_refreshing: set = set()
+# Today's showtimes sell out and shift; Friday's 8pm show is still Friday's 8pm
+# show an hour later. Refreshing all five days on the fast clock meant four fifths
+# of every crawl re-downloading data that had not changed — and from one IP, that
+# volume is how a scraper gets blocked rather than rate-limited.
+TODAY_TTL = 20 * 60
+FUTURE_TTL = 60 * 60
+DAYS = 5  # today + next 4: each extra day adds ~10 BMS page fetches to the future part
+_refreshing: set = set()   # (city, part) pairs currently being rebuilt
 _refresh_lock = threading.Lock()  # guards the check-and-set below against two
                                    # requests racing to both spawn a refresh thread
 # Serialises snapshot reads against the swap that replaces them. Every reader is a
 # request thread in THIS process, so taking it around the read means no handle is
 # open when the swap runs — which is what Windows requires. It deliberately does
-# NOT cover the crawl itself: that is ~9s of network, and readers must not block
-# on it. atomic_swap's retry then only has to survive openers we don't control
-# (this project lives in a OneDrive folder, which scans files on its own schedule).
+# NOT cover the crawl itself: that is seconds of network, and readers must not
+# block on it. atomic_swap's retry then only has to survive openers we don't
+# control (this project lives in a OneDrive folder, which scans on its own clock).
 _snapshot_lock = threading.Lock()
 
 
+def _part_path(city: str, part: str) -> Path:
+    return CACHE / f"{city}_{date.today():%Y%m%d}_{part}.txt"
+
+
 def crawl(city: str) -> str:
-    """Current listings snapshot; stale-while-revalidate so answers never wait on a crawl."""
+    """Current listings; stale-while-revalidate so answers never wait on a crawl.
+
+    Two snapshots on two clocks — today refreshes three times an hour, the rest of
+    the week once — concatenated into the one blob the model reads."""
     _check_city(city)
     CACHE.mkdir(exist_ok=True)
-    cache_file = CACHE / f"{city}_{date.today():%Y%m%d}.txt"
-    if not cache_file.exists():
-        return _crawl_now(city, cache_file)
-    if time.time() - cache_file.stat().st_mtime > CRAWL_TTL:
+    for old in CACHE.glob(f"{city}_*.txt"):  # yesterday's snapshots
+        if not old.name.startswith(f"{city}_{date.today():%Y%m%d}_"):
+            old.unlink(missing_ok=True)
+    return (_part(city, "today", TODAY_TTL, _build_today) + "\n"
+            + _part(city, "future", FUTURE_TTL, _build_future))
+
+
+def _part(city: str, part: str, ttl: int, build) -> str:
+    path = _part_path(city, part)
+    if not path.exists():
+        return _write_part(city, part, build)
+    if time.time() - path.stat().st_mtime > ttl:
         with _refresh_lock:
-            if city not in _refreshing:
-                _refreshing.add(city)
-                threading.Thread(target=_refresh, args=(city, cache_file), daemon=True).start()
+            if (city, part) not in _refreshing:
+                _refreshing.add((city, part))
+                threading.Thread(target=_refresh, args=(city, part, build), daemon=True).start()
     with _snapshot_lock:  # no reader holds the file open while the swap runs
-        return cache_file.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")
+
+
+def _refresh(city: str, part: str, build):
+    try:
+        _write_part(city, part, build)
+    except Exception as e:
+        print(f"  background refresh failed for {city}/{part}: {e}", file=sys.stderr)
+    finally:
+        _refreshing.discard((city, part))
+
+
+def _write_part(city: str, part: str, build) -> str:
+    text = build(city)
+    path = _part_path(city, part)
+    tmp = path.with_suffix(".tmp")  # atomic swap so a reader never sees a half-written file
+    tmp.write_text(text, encoding="utf-8")
+    with _snapshot_lock:
+        atomic_swap(tmp, path)
+    return text
+
+
+def _bms_day(city: str, movies: list[dict], offset: int, pool) -> list[str]:
+    day = date.today() + timedelta(days=offset)
+    daycode = day.strftime("%Y%m%d")
+    all_rows = list(pool.map(lambda mv: bms_showtimes(mv, daycode), movies))
+    got = [(mv, rows) for mv, rows in zip(movies, all_rows) if rows]
+    label = "today" if offset == 0 else day.strftime("%A")
+    lines = [f"\n# BookMyShow — {day.isoformat()} ({label}), {len(got)} movies"]
+    for mv, rows in got:
+        lines += section(mv, rows)  # mv['book'] was just set for THIS date
+    print(f"  BMS {day.isoformat()}: {len(got)} movies", file=sys.stderr)
+    return lines
+
+
+def _build_today(city: str) -> str:
+    """Everything that actually moves during a day: today's shows, both sources, events."""
+    today_iso = date.today().isoformat()
+    bms_movies = itemlist(fetch(f"https://in.bookmyshow.com/explore/movies-{city}"))
+    dcity = DISTRICT_CITY.get(city, city)
+    district_movies = itemlist(fetch(f"https://www.district.in/movies/?city={dcity}"))
+    if not bms_movies and not district_movies:
+        raise RuntimeError("both sources returned no movies (layout changed or network down)")
+
+    lines = [f"Movie showtimes in {city}, crawled at {datetime.now():%H:%M} (today refreshes "
+             f"every ~20 min, later dates hourly). BookMyShow sections cover {DAYS} dates (see "
+             "headings); District covers today only. The same cinema can appear in both sources "
+             "with different prices — treat them as competing ticket sellers."]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        lines += _bms_day(city, bms_movies, 0, pool)
+        dis_rows = list(pool.map(lambda mv: district_showtimes(mv, city, today_iso), district_movies))
+    got = [(mv, rows) for mv, rows in zip(district_movies, dis_rows) if rows]
+    lines.append(f"\n# District — {today_iso} (today), {len(got)} movies")
+    for mv, rows in got:
+        print(f"  District: {mv['title']} ({len(rows)} venues)", file=sys.stderr)
+        lines += section(mv, rows)
+    events = bms_events(city)
+    print(f"  events: {len(events)}", file=sys.stderr)
+    lines.append("\n# Events & concerts (source: BookMyShow; dates shown per event, not only today)")
+    lines += events or ["- none found"]
+    return "\n".join(lines)
+
+
+def _build_future(city: str) -> str:
+    """Tomorrow onwards — the bulk of the fetches, and the part that barely changes."""
+    movies = itemlist(fetch(f"https://in.bookmyshow.com/explore/movies-{city}"))
+    lines = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for offset in range(1, DAYS):
+            lines += _bms_day(city, movies, offset, pool)
+    return "\n".join(lines)
 
 
 def atomic_swap(tmp: Path, dest: Path, tries: int = 50) -> None:
@@ -344,63 +434,8 @@ def atomic_swap(tmp: Path, dest: Path, tries: int = 50) -> None:
 
 def crawled_at(city: str) -> float:
     """Unix mtime of the snapshot answers are coming from; 0 when nothing is cached."""
-    f = CACHE / f"{city}_{date.today():%Y%m%d}.txt"
+    f = _part_path(city, "today")
     return f.stat().st_mtime if f.exists() else 0
-
-
-def _refresh(city: str, cache_file: Path):
-    try:
-        _crawl_now(city, cache_file)
-    except Exception as e:
-        print(f"  background refresh failed for {city}: {e}", file=sys.stderr)
-    finally:
-        _refreshing.discard(city)
-
-
-def _crawl_now(city: str, cache_file: Path) -> str:
-    """Pull all sources fresh (BMS movies, District movies, BMS events) and write the snapshot."""
-    today_iso = date.today().isoformat()
-    for old in CACHE.glob(f"{city}_*.txt"):  # drop yesterday's snapshots
-        if old != cache_file:
-            old.unlink(missing_ok=True)
-
-    bms_movies = itemlist(fetch(f"https://in.bookmyshow.com/explore/movies-{city}"))
-    dcity = DISTRICT_CITY.get(city, city)
-    district_movies = itemlist(fetch(f"https://www.district.in/movies/?city={dcity}"))
-    if not bms_movies and not district_movies:
-        raise RuntimeError("both sources returned no movies (layout changed or network down)")
-
-    lines = [f"Movie showtimes in {city}, crawled at {datetime.now():%H:%M} (auto-refresh ~20 min). "
-             f"BookMyShow sections cover {DAYS} dates (see headings); District covers today only. "
-             "The same cinema can appear in both sources with different prices — treat them as "
-             "competing ticket sellers."]
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for i in range(DAYS):
-            day = date.today() + timedelta(days=i)
-            daycode = day.strftime("%Y%m%d")
-            all_rows = list(pool.map(lambda mv: bms_showtimes(mv, daycode), bms_movies))
-            got = [(mv, rows) for mv, rows in zip(bms_movies, all_rows) if rows]
-            label = "today" if i == 0 else day.strftime("%A")
-            lines.append(f"\n# BookMyShow — {day.isoformat()} ({label}), {len(got)} movies")
-            for mv, rows in got:
-                lines += section(mv, rows)  # mv['book'] was just set for THIS date
-            print(f"  BMS {day.isoformat()}: {len(got)} movies", file=sys.stderr)
-        dis_rows = list(pool.map(lambda mv: district_showtimes(mv, city, today_iso), district_movies))
-    got = [(mv, rows) for mv, rows in zip(district_movies, dis_rows) if rows]
-    lines.append(f"\n# District — {today_iso} (today), {len(got)} movies")
-    for mv, rows in got:
-        print(f"  District: {mv['title']} ({len(rows)} venues)", file=sys.stderr)
-        lines += section(mv, rows)
-    events = bms_events(city)
-    print(f"  events: {len(events)}", file=sys.stderr)
-    lines.append("\n# Events & concerts (source: BookMyShow; dates shown per event, not only today)")
-    lines += events or ["- none found"]
-    text = "\n".join(lines)
-    tmp = cache_file.with_suffix(".tmp")  # atomic swap so a reader never sees a half-written file
-    tmp.write_text(text, encoding="utf-8")
-    with _snapshot_lock:
-        atomic_swap(tmp, cache_file)
-    return text
 
 
 def _read_stream(resp, on_token) -> dict:

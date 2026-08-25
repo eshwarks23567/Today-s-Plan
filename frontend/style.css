@@ -250,6 +250,13 @@ input::placeholder { color: var(--text-dim); }
 .iconbtn:hover { background: rgba(255, 255, 255, .06); color: var(--text); }
 .iconbtn svg { width: 18px; height: 18px; }
 #speak[aria-pressed="false"] { opacity: .5; } /* only the output toggle dims — the mic must never look disabled */
+/* while a reply is being read out, say so — otherwise audio starts with no
+   indication of which control stops it (this one, or Esc) */
+#speak.speaking { color: var(--accent); position: relative; }
+#speak.speaking::after {
+  content: ""; position: absolute; inset: -4px; border-radius: var(--r-ctl);
+  border: 2px solid var(--accent); animation: micRing 1.6s ease-out infinite;
+}
 #mic.listening { background: var(--accent); color: #fff; position: relative; }
 #mic.listening::after {
   content: ""; position: absolute; inset: -4px; border-radius: var(--r-ctl);

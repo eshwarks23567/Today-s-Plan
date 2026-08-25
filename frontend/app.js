@@ -123,7 +123,7 @@ function bindChips() {
 // Restore the homepage in place — no navigation, no re-fetching four CDNs, no lost scroll.
 function freshChat() {
   if (inflight) inflight.abort();
-  speechSynthesis.cancel();
+  resetSpeech();
   localStorage.removeItem("booktic.current");
   chatId = null; history = []; msgs = [];
   chat.innerHTML = HERO_HTML;
@@ -140,7 +140,7 @@ function freshChat() {
 // Swap to a saved conversation in place, with its own history/context.
 function loadChat(rec) {
   if (inflight) inflight.abort();
-  speechSynthesis.cancel();
+  resetSpeech();
   chatId = rec.id; history = rec.history; msgs = rec.msgs;
   citySel.value = rec.city;
   chat.classList.remove("heroed");
@@ -248,7 +248,7 @@ function setBusy(on) {
 async function ask(text) {
   if (busy) return;
   setBusy(true);
-  speechSynthesis.cancel();
+  resetSpeech();
   $("hero")?.remove();
   $("gallery")?.remove();
   chat.classList.remove("heroed");
@@ -315,6 +315,7 @@ async function ask(text) {
         }
         full += ev.text;
         paint();
+        speakStream(full, false);
       } else if (ev.type === "error") {
         retryHint("Something went wrong: " + ev.error, text);
         return;
@@ -345,7 +346,7 @@ async function ask(text) {
     sr.className = "sr-only";
     record(cls, html, true);
     chat.scrollTop = chat.scrollHeight;
-    if (speakOn) say(done.answer);
+    if (speakOn) speakStream(done.answer, true);
   } catch (e) {
     // a half-streamed answer was never recorded, so leaving it on screen would show
     // text that no longer exists in the conversation the server and storage agree on
@@ -414,11 +415,26 @@ function retryHint(message, question) {
 }
 
 // ---- voice out (browser-native) ----
+// Spoken text is not written text. Markdown scaffolding, price ranges and 24-hour
+// style times all have to be rewritten or the synthesiser reads them literally —
+// "hash hash one", "Rs one zero five dash two four nine", "zero seven thirty five".
 const plain = (text) => text
   .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
   .replace(/https?:\/\/\S+/g, "the booking link")  // else it spells the whole URL out, character by character
-  .replace(/[*#_`]/g, "")
-  .replace(/Rs\.?\s?/g, "rupees ");
+  .replace(/^\s*[-*]\s+/gm, "")                    // list bullets, so it doesn't say "dash"
+  .replace(/[*#_`>]/g, " ")
+  .replace(/\s*[•|]\s*/g, ", ")   // "Telugu • 2D | IMAX" -> "Telugu, 2D, IMAX"
+  // a range is spoken "105 to 249 rupees", and in Indian English the unit follows
+  // the number rather than leading it
+  // the number must END on a digit — a plain [\d,]+ eats the separator out of
+  // "Rs50-120, Telugu" and says "50 to 120, rupees"
+  .replace(/(?:Rs\.?\s?|₹\s?)(\d{1,3}(?:,\d{2,3})*(?:\.\d+)?)\s*[-–]\s*(\d{1,3}(?:,\d{2,3})*(?:\.\d+)?)/g,
+           "$1 to $2 rupees")
+  .replace(/(?:Rs\.?\s?|₹\s?)(\d{1,3}(?:,\d{2,3})*(?:\.\d+)?)/g, "$1 rupees")
+  .replace(/(\d+)\.00\b/g, "$1")                   // 250.00 rupees -> 250 rupees
+  .replace(/\b0(\d):(\d\d)/g, "$1:$2")             // 07:35 -> 7:35, not "zero seven"
+  .replace(/[ \t]+([,.])/g, "$1")                  // no gap before punctuation
+  .replace(/[ \t]{2,}/g, " ");
 
 // Pick a real voice instead of leaving it to the lang tag: most Windows installs
 // have no en-IN voice at all, and an unmatched lang silently falls back to the
@@ -454,14 +470,76 @@ function chunks(text, max = 180) {
   return out;
 }
 
-function say(text) {
+// Speech now starts while the answer is still streaming, so it begins a couple of
+// seconds in instead of after the last token — the difference between a voice app
+// and a page that reads itself out once it has finished thinking. A full listings
+// comparison would be minutes of audio nobody asked for, so it stops at the cap
+// and says where the rest is.
+const SPOKEN_CAP = 900;
+let spokenChars = 0, spokenUpTo = 0, capped = false, speaking = false;
+
+function setSpeaking(on) {
+  if (speaking === on) return;
+  speaking = on;
+  speakBtn.classList.toggle("speaking", on);
+}
+
+function utter(text) {
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = "en-IN";
+  if (voice) u.voice = voice;
+  u.onstart = () => setSpeaking(true);
+  u.onend = u.onerror = () => {
+    if (!speechSynthesis.pending && !speechSynthesis.speaking) setSpeaking(false);
+  };
+  speechSynthesis.speak(u);
+}
+
+function resetSpeech() {
   speechSynthesis.cancel();
-  for (const part of chunks(plain(text)).slice(0, 14)) {
-    const u = new SpeechSynthesisUtterance(part);
-    u.lang = "en-IN";
-    if (voice) u.voice = voice;
-    speechSynthesis.speak(u);
+  spokenChars = 0; spokenUpTo = 0; capped = false;
+  setSpeaking(false);
+}
+
+// queue without cancelling — the whole point is that it accumulates as tokens land
+function speakMore(raw) {
+  if (capped) return;
+  const text = plain(raw).trim();
+  if (!text) return;
+  for (const part of chunks(text)) {
+    if (spokenChars >= SPOKEN_CAP) {
+      capped = true;
+      return utter("The rest is on screen.");
+    }
+    spokenChars += part.length;
+    utter(part);
   }
+}
+
+function say(text) {  // one-shot: replaces whatever is queued
+  resetSpeech();
+  speakMore(text);
+}
+
+// How much of a partially-arrived answer is safe to speak now: whole sentences
+// only, and never a half-arrived markdown link — cutting inside "[Book](https://…)"
+// would hand the synthesiser a URL to read out character by character.
+function speakableSlice(pending) {
+  const end = pending.match(/^[\s\S]*[.!?:\n](?=\s)/);
+  if (!end) return "";                                  // no sentence has closed yet
+  return /\[[^\]]*$|\([^)]*$/.test(end[0]) ? "" : end[0];
+}
+
+function speakStream(full, finished) {
+  if (!speakOn || capped) return;
+  let pending = full.slice(spokenUpTo);
+  if (!finished) {
+    pending = speakableSlice(pending);
+    if (!pending) return;
+  }
+  if (!pending.trim()) return;
+  spokenUpTo += pending.length;
+  speakMore(pending);
 }
 
 if (location.hash === "#selftest") {  // open /#selftest in the browser console
@@ -469,14 +547,24 @@ if (location.hash === "#selftest") {  // open /#selftest in the browser console
   console.assert(c.join(" ") === "a. b. c.", "chunks: lossy", c);
   console.assert(c.every(s => s.length <= 5), "chunks: over max", c);
   console.assert(chunks("x".repeat(400)).length === 3, "chunks: unbroken run");
-  console.assert(plain("see [Book](https://x.com/a) or https://y.in/b") ===
-    "see Book or the booking link", "plain: url leaked");
+  const spoken = (t) => plain(t).replace(/\s+/g, " ").trim();
+  console.assert(spoken("see [Book](https://x.com/a) or https://y.in/b") ===
+    "see Book or the booking link", "plain: url leaked", spoken("see [Book](https://x.com/a)"));
+  console.assert(spoken("- INOX: 07:35 PM Rs105-249") === "INOX: 7:35 PM 105 to 249 rupees",
+    "plain: price range / time", spoken("- INOX: 07:35 PM Rs105-249"));
+  console.assert(spoken("**AMB** Rs 1,250.00 | Telugu • 2D") ===
+    "AMB 1,250 rupees, Telugu, 2D", "plain: markdown / units", spoken("**AMB** Rs 1,250.00 | Telugu • 2D"));
+  // the incremental feeder: whole sentences, never mid-link
+  console.assert(speakableSlice("One. Two") === "One.", "speakable: sentence");
+  console.assert(speakableSlice("No end yet") === "", "speakable: waits for a full sentence");
+  console.assert(speakableSlice("Try [Book now. ](htt") === "", "speakable: cut inside a link");
+  console.assert(speakableSlice("Done. [Book](htt") === "Done.", "speakable: stops before the link");
 }
 speakBtn.onclick = () => {
   speakOn = !speakOn;
   localStorage.setItem("booktic.speak", speakOn ? "1" : "0");
   speakBtn.setAttribute("aria-pressed", String(speakOn));
-  if (!speakOn) speechSynthesis.cancel();
+  if (!speakOn) resetSpeech();
 };
 
 // keyboard accelerators: "/" focuses the input; Esc stops speech, skips an
@@ -484,7 +572,7 @@ speakBtn.onclick = () => {
 addEventListener("keydown", (e) => {
   if (e.key === "/" && document.activeElement !== q) { e.preventDefault(); q.focus(); }
   if (e.key !== "Escape") return;
-  speechSynthesis.cancel();
+  resetSpeech();
   if (inflight) inflight.abort();
 });
 
@@ -518,7 +606,7 @@ if (SR) {
   };
   micBtn.onclick = () => {
     if (micBtn.classList.contains("listening")) return rec.stop();
-    speechSynthesis.cancel();
+    resetSpeech();  // barge-in: talking over the reply stops it
     micBtn.classList.add("listening");
     micBtn.setAttribute("aria-pressed", "true");
     q.placeholder = "Listening — tap the mic when you're done";
