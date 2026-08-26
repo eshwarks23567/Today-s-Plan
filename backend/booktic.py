@@ -502,7 +502,7 @@ def _read_stream(resp, on_token) -> dict:
 # machine, rather than one integration per vendor.
 PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
 LLM_BASE = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
-LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
 # Applies per socket read, so it bounds a stalled provider rather than the whole
 # answer — streaming keeps resetting it. A minute of dead air is not worth waiting
 # through when the message at the end is only going to say "it did not respond".
@@ -588,7 +588,10 @@ def _ask_openai(system: str, history: list[dict], question: str, tools, on_token
         payload["tools"] = _openai_tools(tools)
     if on_token:
         payload["stream"] = True
-    headers = {"Content-Type": "application/json"}
+    # Cloudflare sits in front of some of these APIs and rejects Python's default
+    # User-Agent outright (403, Cloudflare error 1010) — the same fingerprint check
+    # that makes fetch() shell out to curl for BookMyShow. Ask like a browser.
+    headers = {"Content-Type": "application/json", "User-Agent": UA}
     if key:  # a local Ollama or llama.cpp server needs no key at all
         headers["Authorization"] = f"Bearer {key}"
     req = urllib.request.Request(f"{LLM_BASE}/chat/completions",
@@ -625,7 +628,8 @@ def _ask_gemini(system: str, history: list[dict], question: str, tools, on_token
     for model in ("gemini-flash-latest", "gemini-flash-lite-latest"):  # lite = separate free quota
         req = urllib.request.Request(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:{verb}",
-            data=body, headers={"Content-Type": "application/json", "x-goog-api-key": key})
+            data=body, headers={"Content-Type": "application/json",
+                                "User-Agent": UA, "x-goog-api-key": key})
         try:
             with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as r:
                 out = _read_stream(r, on_token) if on_token else json.load(r)

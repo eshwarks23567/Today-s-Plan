@@ -52,7 +52,7 @@ chat-completions shape, so one adapter covers all of them:
 # open weights, hosted (Groq's free tier is fast and generous)
 $env:LLM_PROVIDER = "openai"
 $env:LLM_API_KEY  = "gsk_..."
-$env:LLM_MODEL    = "llama-3.3-70b-versatile"
+$env:LLM_MODEL    = "openai/gpt-oss-120b"
 
 # open weights, entirely on your own machine — no key, no vendor, no quota
 $env:LLM_PROVIDER = "openai"
@@ -62,6 +62,16 @@ $env:LLM_MODEL    = "llama3.2"
 
 The server prints which model it is using at startup. `LLM_BASE_URL` defaults to
 Groq; `LLM_API_KEY` is optional, because a local server does not want one.
+
+**Mind the token budget.** A city's listings are ~26,000 tokens, and every turn
+carries all of them. Gemini's free tier swallows that; Groq's free tier caps at
+8,000 tokens per minute, so it returns HTTP 413 on a large city no matter which
+model you pick — fine for a small city or a paid tier. A local Ollama has no such
+limit, only your own hardware.
+
+Some of these APIs sit behind Cloudflare, which rejects Python's default
+`User-Agent` outright with a 403 (error 1010), so requests go out with a browser
+one. The same check is why `fetch()` shells out to curl for BookMyShow.
 
 Two things the model must support, whichever you pick: **streaming**, or answers
 arrive all at once after fifteen seconds, and **tool calling**, or booking stops
@@ -141,7 +151,7 @@ dependencies; dropping Playwright for a deep link removed the last one.
 | full answer (13–15k chars) | 16–21s |
 | dead air removed by streaming | **12.8–19.3s** |
 | LLM calls per booking turn | 1 (was 2) |
-| prompt carried per turn | ~13,000 tokens of listings |
+| prompt carried per turn | ~26,000 tokens of listings (measured by the API, not estimated) |
 | language/format annotation | 3,900 chars (11,300 before hoisting it per venue) |
 
 Time-to-first-token is roughly flat regardless of answer length — that is the model
