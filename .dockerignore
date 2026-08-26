@@ -1,0 +1,15 @@
+# Crawl snapshots are per-day and per-machine; baking them in would ship stale
+# listings that look current until the first refresh.
+backend/cache/
+backend/prefs.json
+backend/logs/
+
+__pycache__/
+**/__pycache__/
+*.pyc
+
+.git/
+.gitignore
+.impeccable/
+run.ps1
+*.md

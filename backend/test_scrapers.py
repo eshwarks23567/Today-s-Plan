@@ -20,6 +20,10 @@ import urllib.request
 import agent
 import booktic
 
+# Captured before main() starts monkeypatching booktic.fetch for the parser
+# fixtures — test_fetch_retries_challenges needs the real one.
+REAL_FETCH = booktic.fetch
+
 FAILURES = []
 
 
@@ -490,6 +494,45 @@ def test_openai_provider():
         srv.shutdown()
 
 
+def test_fetch_retries_challenges():
+    """Cloudflare returns HTTP 200 with an interstitial, so a blocked fetch is
+    indistinguishable from a good one until the parser finds nothing — which is how
+    the listings sat empty for five days. It has to be detected, not returned."""
+    import subprocess
+    challenge = "<html><head><title>Just a moment...</title></head><body>x</body></html>"
+    real = "<html><head><title>Hyderabad Movie Tickets</title></head></html>"
+
+    class Result:
+        def __init__(self, out):
+            self.returncode, self.stdout, self.stderr = 0, out, ""
+
+    calls = []
+    queue = [challenge, challenge, real]
+    real_run, real_sleep = subprocess.run, booktic.time.sleep
+    try:
+        booktic.subprocess.run = lambda *a, **k: (calls.append(1), Result(queue[len(calls) - 1]))[1]
+        booktic.time.sleep = lambda s: None  # do not actually wait during a test
+        out = REAL_FETCH("https://in.bookmyshow.com/x")
+        check("fetch retries past an interstitial and returns the real page", out == real)
+        check("fetch keeps trying until it gets a usable page", len(calls) == 3)
+
+        calls.clear()
+        queue[:] = [challenge, challenge, challenge]
+        try:
+            REAL_FETCH("https://in.bookmyshow.com/x")
+            check("fetch raises when every try is challenged", False)
+        except RuntimeError as e:
+            check("fetch raises when every try is challenged", "interstitial" in str(e))
+
+        calls.clear()
+        queue[:] = [real, real, real]
+        REAL_FETCH("https://in.bookmyshow.com/x")
+        check("a good page costs exactly one request", len(calls) == 1)
+    finally:
+        booktic.subprocess.run = real_run
+        booktic.time.sleep = real_sleep
+
+
 def test_needs_future():
     """The later dates are a third of a ~26,000-token prompt carried on every turn.
     Deciding wrongly in the generous direction only costs tokens; deciding wrongly
@@ -688,6 +731,7 @@ def main():
     print("agent confirmation"); test_agent_confirms_before_acting()
     print("openai-compatible provider"); test_openai_provider()
     print("booking url allowlist"); test_safe_booking_url()
+    print("fetch resilience"); test_fetch_retries_challenges()
     print("prompt scoping"); test_needs_future(); test_crawl_trims_future(install)
     print("provider resilience"); test_provider_stall(); test_error_detail_is_scoped()
     print("concurrency"); test_prefs_concurrency(); test_atomic_swap()

@@ -121,6 +121,8 @@ browser — faster, far less code, and it actually works.
 Scraping notes, hard-earned:
 
 - BookMyShow's CDN blocks Python's TLS fingerprint but not plain `curl` — fetches shell out to `curl.exe`, pinned to https so a hostile link in a listing can't read local files
+- **Cloudflare answers a challenged request with HTTP 200 and a "Just a moment…" page**, so a blocked fetch is indistinguishable from a good one until the parser finds nothing in it. `fetch()` detects the interstitial by title and retries; the `challenge-platform` script tag is NOT a tell, it is on every page including good ones
+- The LLM APIs fingerprint too: Groq answers a default-User-Agent request with 403 (Cloudflare error 1010) and Google's endpoint just swallows it, so model calls send a browser UA as well
 - Showtimes live in `showtimesFunctionalApi.queries['fetchPrimaryDynamic-…']` inside `__INITIAL_STATE__`. The older `showtimesByEvent.showDates` is still present but is now always empty — parsing it silently yields zero movies
 - Per-category prices are not on the showtime. They sit in the bottom sheet each showtime opens on double-tap, as display strings like `₹ 1,250.00`
 - **Ask BookMyShow for a date with no shows and it answers with that movie's next available date**, correctly formatted and entirely plausible. The parser compares the served `dateCode` against the requested one and drops mismatches, or next Friday's showtimes end up filed under today
@@ -190,6 +192,23 @@ Windows, and the server was listening on IPv4 only, so every connection paid a
 | tests | 930 lines across 3 files |
 | frontend | 658 JS + 305 CSS lines |
 | checks | 63 offline, 8 live |
+
+## Docker
+
+```powershell
+docker build -t todaysplan .
+docker run -p 8765:8765 -e GEMINI_API_KEY=$env:GEMINI_API_KEY todaysplan
+```
+
+195MB, and no `pip install` step — the image is a base image plus the source. It
+does need `curl`, which `python:slim` does not ship: `fetch()` shells out to it,
+and without it every crawl dies with `fetch failed (exit 127)`, which reads like
+an application bug rather than a missing binary.
+
+Setting `$PORT` is what puts the server in hosted mode, so the Dockerfile
+defaults it — otherwise the server would bind loopback *inside* the container and
+be reachable by nothing. Runs as a non-root user; the crawl snapshots under
+`backend/cache` are the only thing written at runtime.
 
 ## Tests
 

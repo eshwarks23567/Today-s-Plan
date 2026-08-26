@@ -25,19 +25,35 @@ def _check_city(city: str) -> None:
         raise ValueError(f"unknown city {city!r}")
 
 
-def fetch(url: str) -> str:
+# Cloudflare answers a challenged request with HTTP 200 and an interstitial, so a
+# blocked fetch looks exactly like a successful one until the parser quietly finds
+# nothing in it — the silent-zero that left the listings empty for five days once
+# already. Only the title is a reliable tell: the challenge-platform script tag
+# appears on perfectly good pages too.
+_CHALLENGE = re.compile(r"<title>\s*just a moment", re.I)
+
+
+def fetch(url: str, tries: int = 3) -> str:
     # ponytail: shelling out to curl because Akamai 403s python TLS; swap to curl_cffi if this breaks
     # --proto pins this to https even after a redirect: most urls here come out of
     # scraped JSON-LD, and curl speaks file://, scp:// and more, so an attacker-set
     # link in a listing could otherwise make us read local files into the prompt
-    r = subprocess.run(
-        ["curl", "-s", "-L", "--proto", "=https", "--proto-redir", "=https",
-         "--max-time", "30", "-A", UA, url],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    if r.returncode != 0 or not r.stdout:
-        raise RuntimeError(f"fetch failed ({r.returncode}): {url}")
-    return r.stdout
+    problem = "no attempt"
+    for attempt in range(tries):
+        r = subprocess.run(
+            ["curl", "-s", "-L", "--proto", "=https", "--proto-redir", "=https",
+             "--max-time", "30", "-A", UA, url],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        if r.returncode != 0 or not r.stdout:
+            problem = f"exit {r.returncode}"
+        elif _CHALLENGE.search(r.stdout[:2000]):
+            problem = "got a Cloudflare interstitial"
+        else:
+            return r.stdout
+        if attempt < tries - 1:
+            time.sleep(1.0 + attempt)  # a challenge usually clears on the next try
+    raise RuntimeError(f"fetch failed ({problem}) after {tries} tries: {url}")
 
 
 def itemlist(html: str) -> list[dict]:
