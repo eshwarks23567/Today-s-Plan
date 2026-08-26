@@ -490,6 +490,52 @@ def test_openai_provider():
         srv.shutdown()
 
 
+def test_needs_future():
+    """The later dates are a third of a ~26,000-token prompt carried on every turn.
+    Deciding wrongly in the generous direction only costs tokens; deciding wrongly
+    the other way costs an answer, so this leans towards including."""
+    for q in ("what is playing tonight?", "cheapest tickets", "book 2 seats for Alpha",
+              "yes", "any Telugu shows after 9 pm?", "the second one", "shows under Rs200",
+              "is that satisfied? maybe"):
+        check(f"stays on today: {q[:32]}", not booktic.needs_future(q))
+    for q in ("what is on tomorrow?", "anything good this weekend?", "shows on Friday",
+              "movies on the 28th", "what about next week", "sat night plans",
+              "upcoming concerts"):
+        check(f"pulls later dates: {q[:32]}", booktic.needs_future(q))
+
+    # a follow-up carries no date of its own, so the turns it answers are read too
+    asked_friday = [{"role": "user", "parts": [{"text": "what is on Friday?"}]},
+                    {"role": "model", "parts": [{"text": "Three films on Friday..."}]}]
+    check("a follow-up inherits the date from the turns it replies to",
+          booktic.needs_future("book the second one", asked_friday))
+    later = [{"role": "user", "parts": [{"text": "and the cheapest?"}]},
+             {"role": "model", "parts": [{"text": "Rs 150 at AMB"}]}]
+    check("an old date scrolls out once the conversation moves on",
+          not booktic.needs_future("book the second one", asked_friday + later * 2))
+
+
+def test_crawl_trims_future(monkeypatch_fetch):
+    """Trimming must not read as 'nothing else is playing' — the model has to know
+    the later dates exist so it can offer to look them up."""
+    real = booktic._part
+    # sized like the real sections (future is ~20k chars), or the note that replaces
+    # it outweighs what it replaced and the size assertion means nothing
+    booktic._part = lambda city, part, ttl, build: (
+        "[TODAY SECTION]" + "t" * 37_000 if part == "today" else "[FUTURE SECTION]" + "f" * 20_000)
+    try:
+        full = booktic.crawl("hyderabad", True)
+        trimmed = booktic.crawl("hyderabad", False)
+        check("full crawl carries both parts",
+              "[TODAY SECTION]" in full and "[FUTURE SECTION]" in full)
+        check("trimmed crawl drops the future part",
+              "[TODAY SECTION]" in trimmed and "[FUTURE SECTION]" not in trimmed)
+        check("trimmed crawl says the later dates still exist",
+              "DO exist" in trimmed and "ask them to name the day" in trimmed)
+        check("trimming actually makes the prompt smaller", len(trimmed) < len(full))
+    finally:
+        booktic._part = real
+
+
 def test_provider_stall():
     """A provider that accepts the connection and never answers is not hypothetical —
     it is what Gemini did from this machine for hours. It has to come back as a
@@ -642,6 +688,7 @@ def main():
     print("agent confirmation"); test_agent_confirms_before_acting()
     print("openai-compatible provider"); test_openai_provider()
     print("booking url allowlist"); test_safe_booking_url()
+    print("prompt scoping"); test_needs_future(); test_crawl_trims_future(install)
     print("provider resilience"); test_provider_stall(); test_error_detail_is_scoped()
     print("concurrency"); test_prefs_concurrency(); test_atomic_swap()
 

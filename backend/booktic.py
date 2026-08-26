@@ -339,18 +339,48 @@ def _part_path(city: str, part: str) -> Path:
     return CACHE / f"{city}_{date.today():%Y%m%d}_{part}.txt"
 
 
-def crawl(city: str) -> str:
+# Does this turn need the later dates at all? Most do not — "what's on tonight",
+# "cheapest seats", "book that one" are all answered by today alone, and the future
+# section is a third of a ~26,000-token prompt carried on EVERY request. Getting
+# this wrong in the generous direction only costs tokens; getting it wrong the other
+# way costs an answer, so the pattern leans towards including.
+AHEAD = re.compile(
+    r"\b(tomorrow|weekend|next\s+week|this\s+week|later|upcoming|advance|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)\b"
+    r"|\b\d{1,2}\s*(st|nd|rd|th)\b"
+    r"|\b(jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b", re.I)
+
+
+def needs_future(question: str, history: list[dict] | None = None) -> bool:
+    """True when the question — or the couple of turns it is replying to — refers to
+    a day other than today. A follow-up like "book the second one" carries no date of
+    its own, so the recent turns are read too."""
+    recent = [question]
+    for turn in (history or [])[-4:]:
+        recent += [p.get("text", "") for p in turn.get("parts", [])]
+    return any(AHEAD.search(t or "") for t in recent)
+
+
+def crawl(city: str, ahead: bool = True) -> str:
     """Current listings; stale-while-revalidate so answers never wait on a crawl.
 
     Two snapshots on two clocks — today refreshes three times an hour, the rest of
-    the week once — concatenated into the one blob the model reads."""
+    the week once. `ahead=False` sends only today, which is what most questions
+    actually need and roughly a third less prompt on every one of them."""
     _check_city(city)
     CACHE.mkdir(exist_ok=True)
     for old in CACHE.glob(f"{city}_*.txt"):  # yesterday's snapshots
         if not old.name.startswith(f"{city}_{date.today():%Y%m%d}_"):
             old.unlink(missing_ok=True)
-    return (_part(city, "today", TODAY_TTL, _build_today) + "\n"
-            + _part(city, "future", FUTURE_TTL, _build_future))
+    today = _part(city, "today", TODAY_TTL, _build_today)
+    if ahead:
+        return today + "\n" + _part(city, "future", FUTURE_TTL, _build_future)
+    # Say so, or the model reads "only today is here" as "nothing else is playing"
+    # and tells the user this is all there is.
+    return today + ("\n\n# Later dates\nOnly today's listings are loaded this turn. Shows for "
+                    "the next few days DO exist — if the user asks about another day, say you "
+                    "can look it up and ask them to name the day.")
 
 
 def _part(city: str, part: str, ttl: int, build) -> str:
@@ -408,7 +438,7 @@ def _build_today(city: str) -> str:
         raise RuntimeError("both sources returned no movies (layout changed or network down)")
 
     lines = [f"Movie showtimes in {city}, crawled at {datetime.now():%H:%M} (today refreshes "
-             f"every ~20 min, later dates hourly). BookMyShow sections cover {DAYS} dates (see "
+             f"every ~20 min, later dates hourly). Each section is labelled with its own date (see "
              "headings); District covers today only. The same cinema can appear in both sources "
              "with different prices — treat them as competing ticket sellers."]
     with ThreadPoolExecutor(max_workers=8) as pool:

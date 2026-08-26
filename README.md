@@ -63,8 +63,9 @@ $env:LLM_MODEL    = "llama3.2"
 The server prints which model it is using at startup. `LLM_BASE_URL` defaults to
 Groq; `LLM_API_KEY` is optional, because a local server does not want one.
 
-**Mind the token budget.** A city's listings are ~26,000 tokens, and every turn
-carries all of them. Gemini's free tier swallows that; Groq's free tier caps at
+**Mind the token budget.** A city's listings are ~26,000 tokens. Turns that do not
+mention another day send today only (~35% less), but every turn still carries the
+whole of that day. Gemini's free tier swallows that; Groq's free tier caps at
 8,000 tokens per minute, so it returns HTTP 413 on a large city no matter which
 model you pick — fine for a small city or a paid tier. A local Ollama has no such
 limit, only your own hardware.
@@ -151,7 +152,8 @@ dependencies; dropping Playwright for a deep link removed the last one.
 | full answer (13–15k chars) | 16–21s |
 | dead air removed by streaming | **12.8–19.3s** |
 | LLM calls per booking turn | 1 (was 2) |
-| prompt carried per turn | ~26,000 tokens of listings (measured by the API, not estimated) |
+| prompt carried per turn | ~26,000 tokens with later dates, ~17,000 without |
+| turns that need later dates | only those naming one — the rest send 35% less |
 | language/format annotation | 3,900 chars (11,300 before hoisting it per venue) |
 
 Time-to-first-token is roughly flat regardless of answer length — that is the model

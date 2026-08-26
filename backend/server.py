@@ -202,7 +202,9 @@ class Handler(BaseHTTPRequestHandler):
             # TypeError rather than the ValueError the 400 path expects
             if not isinstance(city, str):
                 raise ValueError("'city' must be a string")
-            listings = booktic.crawl(city)  # raises ValueError for an unknown city
+            # Only pay for the later dates when the turn is actually about them
+            ahead = booktic.needs_future(question, history)
+            listings = booktic.crawl(city, ahead)  # raises ValueError for an unknown city
         except (json.JSONDecodeError, ValueError) as e:
             return self._json(400, {"error": str(e)})
         except Exception as e:
