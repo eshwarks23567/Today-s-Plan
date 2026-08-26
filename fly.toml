@@ -1,0 +1,49 @@
+# fly.toml — deploy config for Today's Plan.
+#
+#   fly apps create todays-plan          (pick your own name, then edit `app` below)
+#   fly secrets set GEMINI_API_KEY=...
+#   fly deploy
+#
+app = "todays-plan"
+
+# Mumbai. Both the users and the sites being read are in India, so this is the
+# shortest path for the crawl AND the least surprising origin for BookMyShow to
+# see — a request to an Indian ticketing site from an Indian datacenter draws
+# less suspicion than one from Virginia.
+primary_region = "bom"
+
+[build]
+  # nothing here: the Dockerfile at the repo root is the whole build
+
+[env]
+  # server.py treats a set $PORT as "shared host": bind every interface, rate-limit
+  # on the proxy's forwarded client IP, and stop learning preferences into what is
+  # a single global file. The Dockerfile sets this too; repeated here so the
+  # behaviour is visible in the deploy config rather than buried in an image.
+  PORT = "8765"
+
+[http_service]
+  internal_port = 8765
+  force_https = true
+  auto_start_machines = true
+
+  # "suspend" rather than "stop": a suspended machine resumes with its filesystem,
+  # so the day's crawl snapshots survive. A cold start re-crawls from scratch —
+  # 74 fetches in one burst, which is exactly the shape that makes BookMyShow start
+  # serving Cloudflare interstitials.
+  auto_stop_machines = "suspend"
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+    method = "GET"
+    path = "/"
+
+[[vm]]
+  # The backend is stdlib-only, but a crawl runs eight concurrent curl
+  # subprocesses and holds ~50KB of listings per city in memory.
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
