@@ -262,9 +262,14 @@ class Handler(BaseHTTPRequestHandler):
 
 def _warm(city: str):
     """Crawl in the background at boot — otherwise the day's first question sits
-    inside crawl() for ~a minute with nothing on screen but typing dots."""
+    inside crawl() waiting on the network with nothing on screen but typing dots.
+
+    Today only: that is 22 fetches rather than 74, and the later dates are built
+    lazily the first time someone actually asks about another day. It matters most
+    on a free host that sleeps, where every wake pays this again — and a 74-request
+    burst is exactly the shape that makes BookMyShow start serving interstitials."""
     try:
-        booktic.crawl(city)
+        booktic.crawl(city, ahead=False)
         print(f"listings ready for {city}", file=sys.stderr)
     except Exception:
         _log_error()  # the first request will simply crawl again

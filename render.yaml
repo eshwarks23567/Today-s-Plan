@@ -1,0 +1,25 @@
+# Render Blueprint. Free instance types sleep after inactivity, so every wake
+# re-runs the boot crawl — which is why _warm() builds today only (22 fetches,
+# not 74). The later dates are built lazily the first time someone asks.
+#
+#   Render dashboard -> New -> Blueprint -> point at this repo
+#   then set GEMINI_API_KEY in the dashboard (sync:false below means it is NOT
+#   read from this file, so the key never lands in git)
+services:
+  - type: web
+    name: todays-plan
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore # closest Render offers to India; Fly has Mumbai if you move
+    healthCheckPath: /
+    envVars:
+      # Render injects its own PORT; server.py reads it and treats a set PORT as
+      # "shared host" — bind every interface, rate-limit on the forwarded client
+      # IP, and stop learning preferences into one global file.
+      - key: GEMINI_API_KEY
+        sync: false # prompted in the dashboard, never stored in the repo
+      # A shared free-tier key is roughly 1,500 Gemini requests a day across
+      # everyone. Lower this if you post the link anywhere public.
+      - key: RATE_PER_DAY
+        value: "40"
