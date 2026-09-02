@@ -76,6 +76,20 @@ Some of these APIs sit behind Cloudflare, which rejects Python's default
 `User-Agent` outright with a 403 (error 1010), so requests go out with a browser
 one. The same check is why `fetch()` shells out to curl for BookMyShow.
 
+`GEMINI_MODELS` is a fallback chain, tried in order — they have separate free
+quotas, so a model that is throttled or down falls through to the next one.
+
+> **Currently pinned to `gemini-flash-lite-latest`** in `fly.toml` and
+> `render.yaml`. As of 2026-09-02 `gemini-flash-latest` returns 503 and then
+> times out (0/3 against flash-lite's 3/3 at ~0.9s), and leaving it first in the
+> chain costs a 30s stall before the fallback answers — 36s turns instead of 2s.
+> Check whether it has recovered, and delete the pin when it has, because lite
+> follows the grounding rules less well:
+>
+> ```powershell
+> python backend/booktic.py --check-models
+> ```
+
 Two things the model must support, whichever you pick: **streaming**, or answers
 arrive all at once after fifteen seconds, and **tool calling**, or booking stops
 working and every request becomes a chat reply. Most instruction-tuned open models

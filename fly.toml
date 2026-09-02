@@ -22,6 +22,13 @@ primary_region = "bom"
   # behaviour is visible in the deploy config rather than buried in an image.
   PORT = "8765"
 
+  # WORKAROUND, 2026-09-02: gemini-flash-latest is returning 503 and then
+  # timing out (measured 0/3 successes, while flash-lite was 3/3 at ~0.9s).
+  # Leaving it in the chain costs a 30s stall before the fallback gets a turn.
+  # Re-check with the health probe in the README and DELETE this once it
+  # recovers — lite follows the grounding rules less well.
+  GEMINI_MODELS = "gemini-flash-lite-latest"
+
 [http_service]
   internal_port = 8765
   force_https = true

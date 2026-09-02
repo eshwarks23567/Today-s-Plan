@@ -23,3 +23,9 @@ services:
       # everyone. Lower this if you post the link anywhere public.
       - key: RATE_PER_DAY
         value: "40"
+      # WORKAROUND, 2026-09-02: gemini-flash-latest returns 503 then times out
+      # (0/3 vs flash-lite's 3/3 at ~0.9s), and leaving it first in the chain
+      # costs a 30s stall before the fallback answers. Delete this key once it
+      # recovers — lite follows the grounding rules less well.
+      - key: GEMINI_MODELS
+        value: "gemini-flash-lite-latest"

@@ -837,8 +837,34 @@ def ask_llm(question: str, listings: str, history: list[dict], tools: list | Non
     return out
 
 
+def check_models() -> None:
+    """Which models in the chain are actually answering right now. Exists so the
+    GEMINI_MODELS pin gets removed when the outage that justified it ends, rather
+    than quietly becoming permanent."""
+    import urllib.error
+    body = json.dumps({"contents": [{"role": "user", "parts": [{"text": "say hi"}]}]}).encode()
+    key = os.environ.get("GEMINI_API_KEY", "")
+    for model in ("gemini-flash-latest", "gemini-flash-lite-latest"):
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            data=body, headers={"Content-Type": "application/json",
+                                "User-Agent": UA, "x-goog-api-key": key})
+        started = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                r.read()
+            print(f"  {model:26} ok    {time.time() - started:.1f}s")
+        except urllib.error.HTTPError as e:
+            print(f"  {model:26} HTTP {e.code}")
+        except Exception as e:
+            print(f"  {model:26} {type(e).__name__} after {time.time() - started:.0f}s")
+    print(f"\n  chain in use: {GEMINI_MODELS}")
+
+
 def main():
     args = sys.argv[1:]
+    if "--check-models" in args:
+        return check_models()
     city = args[args.index("--city") + 1] if "--city" in args else "hyderabad"
     print(f"BookTic — {city}. Crawling today's listings (first run takes ~a minute)...")
     listings = crawl(city)
