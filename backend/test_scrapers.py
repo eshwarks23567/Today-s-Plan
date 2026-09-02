@@ -533,6 +533,52 @@ def test_fetch_retries_challenges():
         booktic.time.sleep = real_sleep
 
 
+def test_gemini_falls_through_a_stalled_model():
+    """A model that accepts the connection and never answers must fall through to
+    the next one. It used to break the loop instead, so one hung model failed the
+    whole request while the next was answering in a second and a half."""
+    import socket
+    import threading
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    held = []
+
+    def stall():
+        while True:
+            try:
+                held.append(srv.accept()[0])
+            except OSError:
+                return
+
+    threading.Thread(target=stall, daemon=True).start()
+    tried = []
+    saved = (booktic.GEMINI_MODELS, booktic.LLM_TIMEOUT, booktic.urllib.request.urlopen)
+    os.environ.setdefault("GEMINI_API_KEY", "test-key")
+    try:
+        booktic.GEMINI_MODELS = ["stalls", "answers"]
+        booktic.LLM_TIMEOUT = 1
+
+        def fake_urlopen(req, timeout=None):
+            model = req.full_url.split("/models/")[1].split(":")[0]
+            tried.append(model)
+            if model == "stalls":
+                raise TimeoutError("read timed out")
+            return io.BytesIO(json.dumps({"candidates": [{"content": {"parts": [
+                {"text": "the second model answered"}]}}]}).encode())
+
+        booktic.urllib.request.urlopen = fake_urlopen
+        out = booktic.ask_llm("hi", "L", [])
+        check("a stalled model falls through to the next", out == "the second model answered")
+        check("both models were actually tried", tried == ["stalls", "answers"])
+    finally:
+        booktic.GEMINI_MODELS, booktic.LLM_TIMEOUT, booktic.urllib.request.urlopen = saved
+        for c in held:
+            c.close()
+        srv.close()
+
+
 def test_needs_future():
     """The later dates are a third of a ~26,000-token prompt carried on every turn.
     Deciding wrongly in the generous direction only costs tokens; deciding wrongly
@@ -732,6 +778,7 @@ def main():
     print("openai-compatible provider"); test_openai_provider()
     print("booking url allowlist"); test_safe_booking_url()
     print("fetch resilience"); test_fetch_retries_challenges()
+    print("model fallback"); test_gemini_falls_through_a_stalled_model()
     print("prompt scoping"); test_needs_future(); test_crawl_trims_future(install)
     print("provider resilience"); test_provider_stall(); test_error_detail_is_scoped()
     print("concurrency"); test_prefs_concurrency(); test_atomic_swap()

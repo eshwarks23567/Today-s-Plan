@@ -399,10 +399,29 @@ def crawl(city: str, ahead: bool = True) -> str:
                     "can look it up and ask them to name the day.")
 
 
+_build_locks: dict = {}
+_build_guard = threading.Lock()
+
+
+def _build_lock(key) -> threading.Lock:
+    """One lock per (city, part), created on demand."""
+    with _build_guard:
+        return _build_locks.setdefault(key, threading.Lock())
+
+
 def _part(city: str, part: str, ttl: int, build) -> str:
     path = _part_path(city, part)
     if not path.exists():
-        return _write_part(city, part, build)
+        # A cold start has two callers arriving at once — the boot warm-up and the
+        # first request — and both find no snapshot. Unguarded they both crawl:
+        # double the fetches, and the visitor waits out a crawl that was already
+        # running. Worse, the doubled burst is what makes BookMyShow start serving
+        # Cloudflare interstitials, so the extra work also poisons the result.
+        with _build_lock((city, part)):
+            if path.exists():  # somebody else finished it while we were waiting
+                with _snapshot_lock:
+                    return path.read_text(encoding="utf-8")
+            return _write_part(city, part, build)
     if time.time() - path.stat().st_mtime > ttl:
         with _refresh_lock:
             if (city, part) not in _refreshing:
@@ -552,7 +571,13 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
 # Applies per socket read, so it bounds a stalled provider rather than the whole
 # answer — streaming keeps resetting it. A minute of dead air is not worth waiting
 # through when the message at the end is only going to say "it did not respond".
-LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", 45))
+LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", 30))
+# Tried in order, first one that answers wins — they have separate free quotas, so
+# this is a fallback chain rather than a preference. Put lite first for latency:
+# measured 1.5s against flash's 4s+, at some cost in how well it follows the
+# grounding rules. GEMINI_MODELS="gemini-flash-lite-latest" to pin one.
+GEMINI_MODELS = [m.strip() for m in os.environ.get(
+    "GEMINI_MODELS", "gemini-flash-latest,gemini-flash-lite-latest").split(",") if m.strip()]
 
 
 def _openai_tools(tools: list | None) -> list:
@@ -671,7 +696,7 @@ def _ask_gemini(system: str, history: list[dict], question: str, tools, on_token
     # should surface immediately rather than being retried into a vaguer message.
     RETRYABLE = (429, 500, 503)
     verb = "streamGenerateContent?alt=sse" if on_token else "generateContent"
-    for model in ("gemini-flash-latest", "gemini-flash-lite-latest"):  # lite = separate free quota
+    for model in GEMINI_MODELS:
         req = urllib.request.Request(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:{verb}",
             data=body, headers={"Content-Type": "application/json",
@@ -685,11 +710,11 @@ def _ask_gemini(system: str, history: list[dict], question: str, tools, on_token
                 raise
             last = e.code
         except (TimeoutError, urllib.error.URLError, OSError):
-            # Not the same as an error response: the request went out and nothing
-            # came back. Trying the second model would just cost another wait, so
-            # stop and say what actually happened.
+            # A model that accepts the connection and never answers has to fall
+            # through like any other failure. Breaking here meant one hung model
+            # failed the whole request while the next one was answering in 1.5s.
+            print(f"  {model} stalled; trying the next model", file=sys.stderr)
             stalled = True
-            break
     if out is None:
         if stalled:
             raise RuntimeError(f"Gemini did not respond within {LLM_TIMEOUT}s. It may be down, or "
