@@ -245,6 +245,55 @@ def test_bms_seat_url(monkeypatch_fetch):
           booktic.bms_seat_url(buy, "AMB Cinemas: Gachibowli", "07:20 PM") is None)
 
 
+def district_page_html(session_time_utc="2026-07-13T16:00", price=175.0,
+                       venue="Roongta Cinemas, Novum, Nampally",
+                       mcd="mkm8o9qs7et", enc="1101081-2694-obbkgo-1101081", fmt="2D") -> str:
+    """District's session payload carries the two ids its own seat-layout URL is
+    built from — mcd names the route, encSessionId identifies the show."""
+    cinemas = [{"cinemaInfo": {"name": venue}, "sessions": [{
+        "showTime": session_time_utc, "areas": [{"price": price}],
+        "scrnFmt": fmt, "mcd": mcd, "encSessionId": enc}]}]
+    fragment = ('"nearbyCinemas":' + json.dumps(cinemas)).replace('"', '\\"')
+    return f'<script>self.__next_f.push([1,"...pageData {fragment} more..."])</script>'
+
+
+def test_district_seat_url(monkeypatch_fetch):
+    """District gets the same one-hop booking BookMyShow does. The URL is not
+    scraped a second time — every part of it is in the session payload, and the
+    result is byte-identical to the one District publishes in its JSON-LD offers."""
+    book = "https://www.district.in/movies/hanuman-ansh-movie-tickets-in-hyderabad-MV225612"
+    expected = ("https://www.district.in/movies/seat-layout/mkm8o9qs7et"
+                "?encsessionid=1101081-2694-obbkgo-1101081&freeseating=false"
+                "&fromsessions=true&type=MOVIES&contentid=225612")
+
+    monkeypatch_fetch(district_page_html())
+    check("district_seat_url builds the exact seat-layout link",
+          booktic.district_seat_url(book, venue="Roongta Cinemas", time_str="9:30 PM",
+                                    today_iso="2026-07-13") == expected)
+
+    monkeypatch_fetch(district_page_html())
+    check("district_seat_url returns None for a showtime that is not there",
+          booktic.district_seat_url(book, "Roongta Cinemas", "11:55 PM",
+                                    today_iso="2026-07-13") is None)
+
+    monkeypatch_fetch(district_page_html())
+    check("district_seat_url returns None for a different venue",
+          booktic.district_seat_url(book, "PVR Nexus", "9:30 PM",
+                                    today_iso="2026-07-13") is None)
+
+    check("district_seat_url needs a content id in the movie url",
+          booktic.district_seat_url("https://www.district.in/movies/no-id", "x", "9:30 PM") is None)
+
+    monkeypatch_fetch(district_page_html())
+    mv = {"title": "Hanuman Ansh",
+          "url": "https://www.district.in/movies/hanuman-ansh-movie-tickets-MV225612"}
+    rows = booktic.district_showtimes(mv, "hyderabad", "2026-07-13")
+    check("district listings still parse after the refactor",
+          rows and rows[0]["sessions"][0]["min"] == 175.0)
+    check("district sessions now carry the screen format too",
+          rows and rows[0]["sessions"][0]["attrs"] == "2D")
+
+
 def test_section():
     mv = {"title": "Alpha", "book": "https://x/alpha"}
     single = booktic.section(mv, [{"venue": "INOX", "sessions": [{"time": "7:35 PM", "min": 105.0, "max": 105.0}]}])
@@ -771,6 +820,7 @@ def main():
     print("district_showtimes"); test_district_showtimes(install)
     print("bms_events (single-event regex fallback)"); test_bms_events_single_event_fallback(install)
     print("bms_seat_url"); test_bms_seat_url(install)
+    print("district deep link"); test_district_seat_url(install)
     print("section"); test_section()
     print("ask_llm history"); test_ask_llm_history()
     print("ask_llm tool calls"); test_ask_llm_tool_call()

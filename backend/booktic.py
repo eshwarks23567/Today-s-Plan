@@ -226,10 +226,17 @@ def bms_seat_url(buy_url: str, venue: str, time_str: str) -> str | None:
 DISTRICT_CITY = {"ncr": "delhi-ncr"}
 
 
-def district_showtimes(movie: dict, city: str, today_iso: str) -> list[dict]:
-    """District: parse SSR pageData.nearbyCinemas[].sessions[] from the city movie page."""
+def district_city_url(movie: dict, city: str) -> str:
     dcity = DISTRICT_CITY.get(city, city)
-    url = movie["url"].replace("-movie-tickets-MV", f"-movie-tickets-in-{dcity}-MV")
+    return movie["url"].replace("-movie-tickets-MV", f"-movie-tickets-in-{dcity}-MV")
+
+
+def _district_page(url: str, today_iso: str) -> list[dict]:
+    """Every session on a District movie page, flattened — the one traversal behind
+    both the listings and the seat-map deep link.
+
+    Each session carries the two ids the booking URL is built from: `mcd` (the
+    format code that names the seat-layout route) and `encSessionId`."""
     try:
         # session JSON sits escaped inside Next.js RSC payload; unescape then raw_decode
         txt = fetch(url).replace('\\"', '"')
@@ -239,9 +246,8 @@ def district_showtimes(movie: dict, city: str, today_iso: str) -> list[dict]:
         cinemas, _ = json.JSONDecoder().raw_decode(txt[txt.find("[", i):])
     except (RuntimeError, json.JSONDecodeError):
         return []
-    rows = []
+    out = []
     for c in cinemas:
-        sessions = []
         for s in c.get("sessions", []):
             when = s.get("showTime", "")  # "2026-07-13T10:46" — UTC despite no suffix
             prices = [a["price"] for a in s.get("areas", []) if a.get("price")]
@@ -250,13 +256,50 @@ def district_showtimes(movie: dict, city: str, today_iso: str) -> list[dict]:
             t = datetime.fromisoformat(when) + timedelta(hours=5, minutes=30)  # → IST
             if t.date().isoformat() != today_iso:
                 continue
-            sessions.append({"time": t.strftime("%I:%M %p").lstrip("0"),
-                             "min": min(prices), "max": max(prices)})
-        if sessions:
-            rows.append({"venue": c.get("cinemaInfo", {}).get("name", "?"), "sessions": sessions})
+            out.append({
+                "venue": (c.get("cinemaInfo") or {}).get("name", "?"),
+                "time": t.strftime("%I:%M %p").lstrip("0"),
+                "min": min(prices), "max": max(prices),
+                "attrs": s.get("scrnFmt", "") or "",
+                "mcd": s.get("mcd", ""),
+                "enc": s.get("encSessionId", ""),
+            })
+    return out
+
+
+def district_showtimes(movie: dict, city: str, today_iso: str) -> list[dict]:
+    """District: all venues/sessions/prices for one movie today."""
+    url = district_city_url(movie, city)
+    rows: dict[str, list] = {}
+    for s in _district_page(url, today_iso):
+        rows.setdefault(s["venue"], []).append(
+            {"time": s["time"], "min": s["min"], "max": s["max"], "attrs": s["attrs"]})
     if rows:
         movie["book"] = url
-    return rows
+    return [{"venue": v, "sessions": ss} for v, ss in rows.items()]
+
+
+def district_seat_url(book_url: str, venue: str, time_str: str,
+                      today_iso: str | None = None) -> str | None:
+    """Deep link straight to one District show's seat map, mirroring bms_seat_url.
+
+    District publishes this exact URL in its JSON-LD offers, and every part of it
+    is in the session payload already parsed above — so it is built rather than
+    scraped a second time."""
+    m = re.search(r"-MV(\d+)", book_url)
+    if not m:
+        return None
+    content_id = m.group(1)
+    vkey = venue.split(":")[0].strip().lower()
+    for s in _district_page(book_url, today_iso or date.today().isoformat()):
+        if s["time"] != time_str or not (s["mcd"] and s["enc"]):
+            continue
+        if vkey and vkey not in s["venue"].lower():
+            continue
+        return (f"https://www.district.in/movies/seat-layout/{s['mcd']}"
+                f"?encsessionid={s['enc']}&freeseating=false&fromsessions=true"
+                f"&type=MOVIES&contentid={content_id}")
+    return None
 
 
 def bms_events(city: str) -> list[str]:

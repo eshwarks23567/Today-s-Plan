@@ -148,10 +148,15 @@ def open_booking(url: str, venue: str, time_str: str, auto_open: bool = True) ->
     link goes back to the client to open instead.
 
     Returns (url resolved, whether it was the exact show's seat map)."""
+    # Both sellers publish everything needed to build a seat-map link; which one
+    # applies is decided by the URL the model copied out of the listings.
     deep = None
-    if venue and time_str and "/buytickets/" in url:
+    if venue and time_str:
         try:
-            deep = booktic.bms_seat_url(url, venue, time_str)
+            if "/buytickets/" in url:
+                deep = booktic.bms_seat_url(url, venue, time_str)
+            elif "district.in" in url:
+                deep = booktic.district_seat_url(url, venue, time_str)
         except Exception:
             traceback.print_exc(file=sys.stderr)  # fall back to the movie page
     target = safe_booking_url(deep or url)

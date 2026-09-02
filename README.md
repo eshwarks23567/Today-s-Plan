@@ -8,11 +8,11 @@ Built to cost nothing to run: no paid APIs, browser-native voice, free-tier LLM,
 
 - **Voice in, voice out** — browser-native speech recognition and TTS, with a live transcript while you speak
 - **Streaming answers** — replies appear as they are generated, so a long comparison starts reading in 2–4s instead of landing all at once after 15+
-- **Language and format** — every showtime carries its language and screen format, so "any Telugu shows after 9?" is answerable
+- **Language and format** — every showtime carries its language and screen format from both sellers, so "any Telugu shows after 9?" is answerable
 - **Two ticket sellers compared** — the same cinema often prices differently on BookMyShow vs District; the agent calls out which is cheaper
 - **5-day showtime window** — today plus the next four days. Today refreshes every ~20 minutes; later dates hourly, because Friday's 8pm show is still Friday's 8pm show an hour later
 - **Events & concerts** — gigs, standup, workshops with dates and starting prices
-- **One-hop booking** — say *"book 2 tickets for Alpha at INOX Odeon 07:35 PM"* and it resolves that exact show to its seat-map URL and opens it. It asks first whenever it had to infer the venue, time or party size rather than being told.
+- **One-hop booking, either seller** — say *"book 2 tickets for Alpha at INOX Odeon 07:35 PM"* and it resolves that exact show to its seat-map URL on BookMyShow *or* District and opens it. It asks first whenever it had to infer the venue, time or party size rather than being told.
 - **Grounded answers only** — the model answers strictly from crawled listings, and every recommendation carries its booking link
 - **Bring your own model** — Gemini by default, or any open-weight model via Groq, OpenRouter or a local Ollama; see [Choosing a model](#choosing-a-model)
 - **Persistent chats** — past conversations and their context survive refreshes, with per-chat delete
@@ -127,6 +127,7 @@ Scraping notes, hard-earned:
 - The LLM APIs fingerprint too: Groq answers a default-User-Agent request with 403 (Cloudflare error 1010) and Google's endpoint just swallows it, so model calls send a browser UA as well
 - Showtimes live in `showtimesFunctionalApi.queries['fetchPrimaryDynamic-…']` inside `__INITIAL_STATE__`. The older `showtimesByEvent.showDates` is still present but is now always empty — parsing it silently yields zero movies
 - Per-category prices are not on the showtime. They sit in the bottom sheet each showtime opens on double-tap, as display strings like `₹ 1,250.00`
+- Both sellers publish enough to build a seat-map link without a second scrape. BookMyShow: region from the query key, `venueCode` from the card, `sessionId` from the showtime. District: `mcd` names the route and `encSessionId` identifies the show — it even publishes the finished URL in its JSON-LD `offers`, which is what the built one is checked against
 - **Ask BookMyShow for a date with no shows and it answers with that movie's next available date**, correctly formatted and entirely plausible. The parser compares the served `dateCode` against the requested one and drops mismatches, or next Friday's showtimes end up filed under today
 - District serves session times in UTC with no timezone marker (+5:30 to IST)
 - Listings snapshots are plain text files with a TTL — stale-while-revalidate, so answers never wait on a crawl
@@ -232,7 +233,6 @@ single-threaded test would have.
 ## Limitations
 
 - Future dates (up to 4 ahead) are BookMyShow-only; District renders only today server-side
-- Deep links to a specific seat map are BookMyShow-only — District bookings open the movie page
 - Gemini's free tier throttles at ~20 requests/min; the app falls back to the lite model, and the server rate-limits to 20/min per IP
 - Voice input needs a browser with the Web Speech API — verify on your own phone before relying on it
 - A Cloudflare quick tunnel hands out a **new URL every restart**, and there is no login on it: treat the link as the password
