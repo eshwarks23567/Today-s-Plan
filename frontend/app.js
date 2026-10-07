@@ -338,6 +338,9 @@ async function ask(text) {
     sr.className = "sr-only";
     record(cls, html, true);
     chat.scrollTop = chat.scrollHeight;
+    // Open it straight away when the browser still counts the send as the click
+    // that caused it (Chrome: ~5s). Blocked pop-up returns null; the link stays.
+    if (done.url && /^https:\/\//.test(done.url)) window.open(done.url, "_blank", "noopener");
     if (speakOn) speakStream(done.answer, true);
   } catch (e) {
     // a half-streamed answer was never recorded, so leaving it on screen would show
