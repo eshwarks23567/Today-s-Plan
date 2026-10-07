@@ -73,14 +73,15 @@ BOOK_TOOL = {"function_declarations": [{
 
 
 def handle(question: str, history: list, listings: str, city: str, on_token=None,
-           on_status=None, auto_open: bool = True) -> tuple[str, bool, str | None]:
+           on_status=None, auto_open: bool = True, on_say=None) -> tuple[str, bool, str | None]:
     """Returns (answer, booked, url) — url is the page booking resolved to, if any.
 
     on_token streams the prose of a plain answer as it arrives; on_status reports
     the booking path, which produces no prose to stream but does take a second or
     two resolving the show. auto_open=False returns the link without opening it
     here, for when the server isn't the machine the person is looking at."""
-    out = booktic.ask_llm(question, listings, history, tools=[BOOK_TOOL], on_token=on_token)
+    out = booktic.ask_llm(question, listings, history, tools=[BOOK_TOOL], on_token=on_token,
+                          on_say=on_say)
     if isinstance(out, str):
         return out, False, None  # a plain answer; ask_llm has already recorded the turn
 

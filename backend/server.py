@@ -235,7 +235,9 @@ class Handler(BaseHTTPRequestHandler):
                 question, history, listings, city,
                 on_token=lambda t: send(type="token", text=t),
                 on_status=lambda t: send(type="status", text=t),
-                auto_open=not remote)
+                auto_open=not remote,
+                # voice on: the reply opens with a short spoken summary, sent apart
+                on_say=(lambda t: send(type="speech", text=t)) if req.get("speak") is True else None)
             send(type="done", answer=answer, history=history, booked=booked, url=url,
                  crawled=booktic.crawled_at(city))
         except (BrokenPipeError, ConnectionError):

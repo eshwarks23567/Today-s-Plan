@@ -262,7 +262,7 @@ async function ask(text) {
   // a hung server would otherwise leave the dots spinning forever
   let timedOut = false;
   const limit = setTimeout(() => { timedOut = true; inflight?.abort(); }, 120000);
-  let bubble = null, full = "", pending = false;
+  let bubble = null, full = "", pending = false, summarised = false;
   // Re-render the accumulated markdown at most once a frame: tokens arrive far
   // faster than the eye resolves, and md() on every one of them is wasted work.
   const paint = () => {
@@ -278,7 +278,7 @@ async function ask(text) {
   try {
     const r = await fetch("/api/ask", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ city: citySel.value, question: text, history }),
+      body: JSON.stringify({ city: citySel.value, question: text, history, speak: speakOn }),
       signal: inflight.signal,
     });
     // errors (400/429/500) still answer as plain JSON — only the answer streams
@@ -307,7 +307,11 @@ async function ask(text) {
         }
         full += ev.text;
         paint();
-        speakStream(full, false);
+        if (!summarised) speakStream(full, false);
+      } else if (ev.type === "speech") {
+        // voice on: the server sends a short spoken summary ahead of the full text
+        summarised = true;
+        if (speakOn) say(ev.text);
       } else if (ev.type === "error") {
         retryHint("Something went wrong: " + ev.error, text);
         return;
@@ -341,7 +345,7 @@ async function ask(text) {
     // Open it straight away when the browser still counts the send as the click
     // that caused it (Chrome: ~5s). Blocked pop-up returns null; the link stays.
     if (done.url && /^https:\/\//.test(done.url)) window.open(done.url, "_blank", "noopener");
-    if (speakOn) speakStream(done.answer, true);
+    if (speakOn && !summarised) speakStream(done.answer, true);
   } catch (e) {
     // a half-streamed answer was never recorded, so leaving it on screen would show
     // text that no longer exists in the conversation the server and storage agree on

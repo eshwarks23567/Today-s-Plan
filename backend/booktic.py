@@ -780,8 +780,44 @@ def _ask_gemini(system: str, history: list[dict], question: str, tools, on_token
     return answer
 
 
+def _split_say(text: str) -> tuple[str, str]:
+    """'SAY: short version\\n\\nfull answer' -> (full answer, short version)."""
+    m = re.match(r"\s*SAY:[ \t]*(.*)(?:\n|$)", text)
+    return (text[m.end():].lstrip(), m.group(1).strip()) if m else (text, "")
+
+
+def _hold_say(on_token, on_say):
+    """Streams tokens on, except a leading SAY line: that is held until it ends and
+    handed to on_say instead, so it is spoken and never shown. A reply that does not
+    open with SAY: (the model forgot) streams untouched."""
+    buf, body = "", False
+
+    def feed(t):
+        nonlocal buf, body
+        if body:
+            return on_token(t)
+        buf += t
+        head = buf.lstrip()
+        if feed.said:  # the blank line between SAY and the answer, split across chunks
+            if head:
+                body = True
+                on_token(head)
+        elif not ("SAY:".startswith(head) or head.startswith("SAY:")):
+            body = True
+            on_token(buf)
+        elif head.startswith("SAY:") and "\n" in head:
+            rest, said = _split_say(buf)
+            feed.said, buf = True, ""
+            on_say(said)
+            if rest:
+                body = True
+                on_token(rest)
+    feed.said = False
+    return feed
+
+
 def ask_llm(question: str, listings: str, history: list[dict], tools: list | None = None,
-            on_token=None):
+            on_token=None, on_say=None):
     """Answer grounded in the listings. Returns the reply text — or, when tools are
     offered and the model calls one, a {"name", "args"} dict, in which case history
     is left untouched for the caller to record once it knows what actually happened.
@@ -826,12 +862,24 @@ def ask_llm(question: str, listings: str, history: list[dict], tools: list | Non
             "or your own suggestion rather than from the user's own words this turn — but leave "
             "it empty when they are simply confirming a plan you already proposed."
         )
+    if on_say:
+        system += ("\n\nThe user is listening, not reading. Start every text reply with one line "
+                   "'SAY: ' followed by a spoken summary of the answer in at most two short "
+                   "sentences - the top pick or two with venue, time and price; no links, no "
+                   "markdown. Then a blank line, then the full answer as usual.")
     system += f"\n\n{listings}"
 
     ask = _ask_gemini if PROVIDER == "gemini" else _ask_openai
+    if on_say and on_token:
+        on_token = _hold_say(on_token, on_say)
     out = ask(system, history, question, tools, on_token)
     if isinstance(out, dict):
         return out  # a tool call: the caller records the turn once it knows the outcome
+    if on_say:
+        out, said = _split_say(out)
+        if said and not getattr(on_token, "said", False):
+            on_say(said)  # unstreamed, or the reply was nothing but the SAY line
+        out = out or said
     if not out.strip():
         raise RuntimeError(f"{PROVIDER} returned an empty answer")
     # Only now is history touched. If the call above raised, the caller retries with

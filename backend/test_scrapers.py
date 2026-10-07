@@ -808,6 +808,25 @@ def test_atomic_swap():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_spoken_summary():
+    """The SAY line is spoken, never shown — however the stream chops it up."""
+    for chunks in (["SAY: Two shows fit.\n\nFull ", "answer"],
+                   ["S", "AY", ": Two shows", " fit.", "\n", "\nFull answer"]):
+        shown, said = [], []
+        feed = booktic._hold_say(shown.append, said.append)
+        for c in chunks:
+            feed(c)
+        check(f"SAY line held back from the stream ({len(chunks)} chunks)", "".join(shown) == "Full answer")
+        check(f"SAY line handed to the voice ({len(chunks)} chunks)", said == ["Two shows fit."])
+    shown, said = [], []
+    feed = booktic._hold_say(shown.append, said.append)
+    for c in ["Sure", ", here it is"]:
+        feed(c)
+    check("a reply without SAY streams untouched", "".join(shown) == "Sure, here it is" and not said)
+    check("split_say strips the line from the saved answer",
+          booktic._split_say("SAY: hi\n\nbody") == ("body", "hi"))
+
+
 def main():
     real_fetch = booktic.fetch
 
@@ -831,6 +850,7 @@ def main():
     print("model fallback"); test_gemini_falls_through_a_stalled_model()
     print("prompt scoping"); test_needs_future(); test_crawl_trims_future(install)
     print("provider resilience"); test_provider_stall(); test_error_detail_is_scoped()
+    print("spoken summary"); test_spoken_summary()
     print("concurrency"); test_prefs_concurrency(); test_atomic_swap()
 
     booktic.fetch = real_fetch
