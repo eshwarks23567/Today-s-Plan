@@ -27,6 +27,11 @@ COPY frontend/ ./frontend/
 ENV PORT=8765
 EXPOSE 8765
 
+# "Today" is date.today(), and containers run on UTC — so from midnight to 5:30
+# IST the crawl asks for yesterday's (finished) shows and finds nothing. POSIX
+# form (sign inverted: UTC+5:30) so it needs no tzdata in the slim image.
+ENV TZ=IST-5:30
+
 # The crawl snapshots are the only thing written at runtime.
 RUN useradd --create-home --uid 10001 app \
  && mkdir -p /app/backend/cache \
