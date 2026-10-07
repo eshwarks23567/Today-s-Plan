@@ -803,7 +803,11 @@ def ask_llm(question: str, listings: str, history: list[dict], tools: list | Non
         "- each date section has its own booking links, so use the link from the date the user wants. "
         "Movie showtimes cover the dates shown in the section headings; for dates beyond them, say "
         "you only see that far ahead. The events/concerts section lists upcoming events with their "
-        f"own dates. Today is {date.today().isoformat()}."
+        "own dates. If the user gives a budget (per ticket, or a total for N tickets - divide it), "
+        "it holds for the rest of the conversation: only recommend or book shows whose lowest price "
+        "fits, and say which price fits, since a range like Rs150-400 spans seat categories. If "
+        "nothing fits, say so and name the closest option - never quietly go over budget. "
+        f"Today is {date.today().isoformat()}."
         + (f"\n\n{pref_line}" if pref_line else "")
     )
     if tools:
@@ -817,7 +821,8 @@ def ask_llm(question: str, listings: str, history: list[dict], tools: list | Non
             "they are asking about showtimes. Never invent a venue or a showtime: fill those "
             "only when the user named them, said 'my usual place' and a preferred venue is "
             "known, or the conversation makes them unambiguous. Copy venue, time and book_url "
-            "verbatim from the listings. List in `inferred` every field you filled from context "
+            "verbatim from the listings. Asked to book within a budget without a specific show, "
+            "pick the best show that fits and fill its venue and time. List in `inferred` every field you filled from context "
             "or your own suggestion rather than from the user's own words this turn — but leave "
             "it empty when they are simply confirming a plan you already proposed."
         )
