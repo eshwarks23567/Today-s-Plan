@@ -69,27 +69,57 @@ BOOK_TOOL = {"function_declarations": [{
         },
         "required": ["movie", "book_url"],
     },
+}, {
+    "name": "watch",
+    "description": ("Tell the user when a movie opens for booking in their city. Their browser "
+                    "keeps the watch and checks while the app is open."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "the movie's title, as the user gave it"},
+            "stop": {"type": "boolean", "description": "true to stop watching it instead"},
+        },
+        "required": ["title"],
+    },
 }]}
 
 
 def handle(question: str, history: list, listings: str, city: str, on_token=None,
-           on_status=None, auto_open: bool = True, on_say=None) -> tuple[str, bool, str | None]:
+           on_status=None, auto_open: bool = True, on_say=None, pref_line: str = "",
+           on_action=None) -> tuple[str, bool, str | None]:
     """Returns (answer, booked, url) — url is the page booking resolved to, if any.
+
+    on_action(**kw) reports what the client should remember: booking={venue, seats}
+    after a booking, watch={title, stop} when a watch is set or cleared.
 
     on_token streams the prose of a plain answer as it arrives; on_status reports
     the booking path, which produces no prose to stream but does take a second or
     two resolving the show. auto_open=False returns the link without opening it
     here, for when the server isn't the machine the person is looking at."""
     out = booktic.ask_llm(question, listings, history, tools=[BOOK_TOOL], on_token=on_token,
-                          on_say=on_say)
+                          on_say=on_say, pref_line=pref_line)
     if isinstance(out, str):
         return out, False, None  # a plain answer; ask_llm has already recorded the turn
 
     call = out.get("args") or {}
-    print("book call:", call, file=sys.stderr)
-    if on_status:
-        on_status("Finding that show…" if call.get("time") else "Looking that up…")
-    answer, booked, url = _book(call, history, city, auto_open)
+    print(f"{out.get('name')} call:", call, file=sys.stderr)
+    booked, url = False, None
+    if out.get("name") == "watch":
+        title, stop = str(call.get("title") or "").strip()[:100], call.get("stop") is True
+        if not title:
+            answer = "Which movie should I watch for?"
+        else:
+            answer = (f"Stopped watching {title}." if stop else
+                      f"I'll tell you when {title} opens for booking — I check whenever Today's "
+                      "Plan is open in this browser, and notify you if you allow it.")
+            if on_action:
+                on_action(watch={"title": title, "stop": stop})
+    else:
+        if on_status:
+            on_status("Finding that show…" if call.get("time") else "Looking that up…")
+        answer, booked, url = _book(call, history, city, auto_open)
+        if booked and on_action:
+            on_action(booking={"venue": call.get("venue") or "", "seats": call.get("seats") or 2})
     # ask_llm deliberately leaves a tool call out of history, so record the turn here
     # as plain text — the next turn and the client's saved transcript then read back
     # as a conversation rather than as a dangling function call

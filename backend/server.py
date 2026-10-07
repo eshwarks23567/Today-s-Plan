@@ -73,6 +73,30 @@ def _safe(e: Exception) -> str:
     return "Something went wrong on the server." if HOSTED else str(e)
 
 
+def client_prefs(p) -> str:
+    """The visitor's browser remembers their budget, party size and cinemas, so the
+    shared server never has to. It arrives with every request, so it is shape-checked
+    and length-capped like any other client input before reaching the prompt."""
+    if not isinstance(p, dict):
+        return ""
+    bits = []
+    budget = p.get("budget")
+    if isinstance(budget, str) and 0 < len(budget) <= 60:
+        bits.append(f"Earlier they gave a budget of '{budget}' - prefer shows that fit when they "
+                    "don't state one, and mention it.")
+    seats = p.get("seats")
+    if isinstance(seats, int) and 1 <= seats <= 10:
+        bits.append(f"They usually book {seats} tickets - assume that when they don't say, and "
+                    "list seats under `inferred` when you do.")
+    venues = p.get("venues")
+    if isinstance(venues, list):
+        venues = [v for v in venues if isinstance(v, str) and 0 < len(v) <= 100][:3]
+        if venues:
+            bits.append(f"Cinemas they have booked before: {'; '.join(venues)}. Prefer these when "
+                        "they say 'my usual place' or don't name a venue.")
+    return " ".join(bits)
+
+
 def lan_ip() -> str:
     # ponytail: UDP "connect" to a public IP picks the right local NIC without
     # sending any packet (connect on UDP just fills in the routing table entry)
@@ -88,6 +112,20 @@ def lan_ip() -> str:
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/api/watch"):
+            # "tell me when it opens": the browser holds the watchlist and polls this.
+            # No model call, and crawl() is cached, so it costs nothing per poll.
+            from urllib.parse import parse_qs, urlparse
+            qs = parse_qs(urlparse(self.path).query)
+            city = qs.get("city", ["hyderabad"])[0]
+            titles = [t for t in qs.get("t", []) if 0 < len(t) <= 100][:10]
+            try:
+                return self._json(200, {"open": booktic.listed(city, titles) if titles else []})
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            except Exception as e:
+                _log_error()
+                return self._json(500, {"error": _safe(e)})
         if self.path.startswith("/api/posters"):
             from urllib.parse import parse_qs, urlparse
             city = parse_qs(urlparse(self.path).query).get("city", ["hyderabad"])[0]
@@ -230,6 +268,7 @@ class Handler(BaseHTTPRequestHandler):
         # link travels back and the page offers it as a button instead.
         remote = HOSTED or any(self.headers.get(h) for h in
                                ("CF-Ray", "CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"))
+        action = {}
         try:
             answer, booked, url = agent.handle(
                 question, history, listings, city,
@@ -237,9 +276,10 @@ class Handler(BaseHTTPRequestHandler):
                 on_status=lambda t: send(type="status", text=t),
                 auto_open=not remote,
                 # voice on: the reply opens with a short spoken summary, sent apart
-                on_say=(lambda t: send(type="speech", text=t)) if req.get("speak") is True else None)
+                on_say=(lambda t: send(type="speech", text=t)) if req.get("speak") is True else None,
+                pref_line=client_prefs(req.get("prefs")), on_action=action.update)
             send(type="done", answer=answer, history=history, booked=booked, url=url,
-                 crawled=booktic.crawled_at(city))
+                 crawled=booktic.crawled_at(city), **action)
         except (BrokenPipeError, ConnectionError):
             pass  # the tab was closed or Esc aborted mid-answer; nothing to report to
         except Exception as e:

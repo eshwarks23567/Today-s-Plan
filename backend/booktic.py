@@ -817,7 +817,7 @@ def _hold_say(on_token, on_say):
 
 
 def ask_llm(question: str, listings: str, history: list[dict], tools: list | None = None,
-            on_token=None, on_say=None):
+            on_token=None, on_say=None, pref_line: str = ""):
     """Answer grounded in the listings. Returns the reply text — or, when tools are
     offered and the model calls one, a {"name", "args"} dict, in which case history
     is left untouched for the caller to record once it knows what actually happened.
@@ -827,9 +827,12 @@ def ask_llm(question: str, listings: str, history: list[dict], tools: list | Non
     is no prose to show, and the caller needs the whole call before it can act.
 
     Which provider answers is decided by PROVIDER; both return the same two shapes,
-    so nothing above this function knows or cares."""
+    so nothing above this function knows or cares.
+
+    pref_line is what the visitor's own browser remembers about them (server.py
+    builds it), on top of anything this machine's prefs.json has learned."""
     import prefs
-    pref_line = prefs.summary()
+    pref_line = " ".join(x for x in (prefs.summary(), pref_line) if x)
     system = (
         "You are BookTic, a movie-ticket assistant. Answer ONLY from the listings below - never invent "
         "movies, venues, times or prices. Prices are per-ticket in INR (Rs). When asked for cheapest, "
@@ -843,6 +846,12 @@ def ask_llm(question: str, listings: str, history: list[dict], tools: list | Non
         "it holds for the rest of the conversation: only recommend or book shows whose lowest price "
         "fits, and say which price fits, since a range like Rs150-400 spans seat categories. If "
         "nothing fits, say so and name the closest option - never quietly go over budget. "
+        "When you recommend specific movie shows, put each on its own line exactly as "
+        "[[show|<movie>|<venue>|<time>|<BookMyShow price>|<District price>]] - movie, venue, time "
+        "and prices copied verbatim from the listings (e.g. Rs180-250), '-' for a source that "
+        "doesn't list that show; fill both when the same cinema has that time in both. The app "
+        "draws these as cards with a Book button, so at most 6, no extra markup on those lines, and "
+        "don't list the same shows again in prose or bullets. "
         f"Today is {date.today().isoformat()}."
         + (f"\n\n{pref_line}" if pref_line else "")
     )
@@ -861,6 +870,8 @@ def ask_llm(question: str, listings: str, history: list[dict], tools: list | Non
             "pick the best show that fits and fill its venue and time. List in `inferred` every field you filled from context "
             "or your own suggestion rather than from the user's own words this turn — but leave "
             "it empty when they are simply confirming a plan you already proposed."
+            "\n\nCall the watch tool when they want to be told once a movie opens for booking "
+            "(typically one not in the listings yet), with stop=true when they no longer do."
         )
     if on_say:
         system += ("\n\nThe user is listening, not reading. Start every text reply with one line "
@@ -888,6 +899,15 @@ def ask_llm(question: str, listings: str, history: list[dict], tools: list | Non
     history.append({"role": "user", "parts": [{"text": question}]})
     history.append({"role": "model", "parts": [{"text": out}]})
     return out
+
+
+def listed(city: str, titles: list[str]) -> list[str]:
+    """Which of these titles now have showtimes on any loaded date — what a "tell me
+    when it opens" watch polls. Loose on purpose: 'Resident Evil' should match
+    'Resident Evil: Requiem (2026)', and punctuation varies between sellers."""
+    norm = lambda t: re.sub(r"[^a-z0-9]+", " ", t.lower()).strip()
+    heads = [norm(h) for h in re.findall(r"^## (.+?)\s+— book:", crawl(city), re.M)]
+    return [t for t in titles if norm(t) and any(norm(t) in h for h in heads)]
 
 
 def check_models() -> None:

@@ -25,6 +25,15 @@ const elFromHTML = (html) => {
 
 // ---- persistence (localStorage; single-user local app needs no DB) ----
 const store = JSON.parse(localStorage.getItem("booktic.chats") || "[]");
+// What this visitor tends to do — budget, party size, cinemas — kept here rather than
+// on the server, which is shared by everyone. Sent with each question.
+const prefs = JSON.parse(localStorage.getItem("booktic.prefs") || "{}");
+const savePrefs = () => localStorage.setItem("booktic.prefs", JSON.stringify(prefs));
+// "under ₹200", "budget is 500 for 2" — kept as said, the model reads it better than a number
+const BUDGET = /\b(?:budget(?:\s+(?:is|of))?|under|below|within|max(?:imum)?|up\s?to)\s*(?:rs\.?|₹|inr)?\s*\d{2,5}(?:\s*(?:for|per)\s+\w+)?/i;
+// "tell me when it opens" — [{title, city}], polled while the app is open
+const watches = JSON.parse(localStorage.getItem("booktic.watch") || "[]");
+const saveWatches = () => localStorage.setItem("booktic.watch", JSON.stringify(watches));
 let chatId = null, msgs = [];
 
 function save() {
@@ -116,8 +125,13 @@ function deleteChat(id) {
   focusRow(Math.min(i, store.length - 1));  // keep the keyboard where the row was
 }
 
+// the filter row's language chip follows the city's own language
+const LOCAL_LANG = { hyderabad: "Telugu", bengaluru: "Kannada", mumbai: "Hindi", ncr: "Hindi",
+                     chennai: "Tamil", pune: "Marathi", kolkata: "Bengali" };
+
 function bindChips() {
   document.querySelectorAll(".chip").forEach(c => c.onclick = () => ask(c.textContent));
+  if ($("langChip")) $("langChip").textContent = LOCAL_LANG[citySel.value] || "Hindi";
 }
 
 // Restore the homepage in place — no navigation, no re-fetching four CDNs, no lost scroll.
@@ -179,7 +193,6 @@ addEventListener("pointerdown", (e) => {
 });
 
 // ---- chat ----
-bindChips();
 citySel.onchange = () => {
   localStorage.setItem("booktic.city", citySel.value);
   if (document.querySelector(".msg")) {
@@ -188,11 +201,13 @@ citySel.onchange = () => {
     return freshChat();
   }
   history = [];
+  bindChips();
   buildGallery();
 };
 if (!localStorage.getItem("booktic.current")) {
   citySel.value = localStorage.getItem("booktic.city") || "hyderabad";
 }
+bindChips();  // after the city is restored: the language chip depends on it
 
 function add(cls, text, asHtml) {
   const d = document.createElement("div");
@@ -218,6 +233,9 @@ function md(t) {
   const closeList = () => { if (inList) { html += "</ul>"; inList = false; } };
   for (const raw of lines) {
     const line = raw.trim();
+    const card = line.match(/^\[\[show\|(.+)\]\]$/);
+    if (card) { closeList(); html += showCard(card[1].split("|")); continue; }
+    if (line.startsWith("[[")) continue;  // a card still streaming in: draw it once it's whole
     if (/^-{3,}$/.test(line)) { closeList(); html += "<hr>"; continue; }
     const h = line.match(/^#{2,4}\s+(.*)$/);
     if (h) { closeList(); html += `<h4>${inline(h[1])}</h4>`; continue; }
@@ -229,6 +247,38 @@ function md(t) {
   closeList();
   return html;
 }
+
+// [[show|movie|venue|time|BMS price|District price]] -> a card with a Book button.
+// Fields arrive already &/< escaped by md(); quotes still need it for the attributes.
+const lowest = (s) => { const m = (s || "").match(/\d[\d,]*/); return m ? +m[0].replace(/,/g, "") : null; };
+function showCard([movie = "", venue = "", time = "", bms = "-", dis = "-"]) {
+  const a = lowest(bms), b = lowest(dis);
+  const best = a != null && (b == null || a <= b) ? "BookMyShow" : b != null ? "District" : "";
+  const pill = (src, val, n) => n == null ? "" :
+    `<span class="pill${src === best && a != null && b != null && a !== b ? " best" : ""}">${src} <b>${val.trim()}</b></span>`;
+  const attr = (s) => s.trim().replace(/"/g, "&quot;");
+  return `<div class="showcard"><div class="sc-what"><b>${movie.trim()}</b><span>${venue.trim()} · ${time.trim()}</span></div>`
+    + `<div class="sc-prices">${pill("BookMyShow", bms, a)}${pill("District", dis, b)}</div>`
+    + `<button type="button" class="sc-book" data-movie="${attr(movie)}" data-venue="${attr(venue)}" `
+    + `data-time="${attr(time)}" data-src="${best}">Book</button></div>`;
+}
+
+// One listener for cards and filters, so buttons restored from a saved chat (stored as
+// HTML, no handlers) work too.
+chat.addEventListener("click", (e) => {
+  const book = e.target.closest(".sc-book");
+  if (book && !busy) {
+    const d = book.dataset, n = prefs.seats || 2;
+    return ask(`Book ${n} tickets for ${d.movie} at ${d.venue}, ${d.time}${d.src ? ` on ${d.src}` : ""}`);
+  }
+  const f = e.target.closest(".fchip");
+  if (f) {
+    f.setAttribute("aria-pressed", String(f.getAttribute("aria-pressed") !== "true"));
+    const on = [...document.querySelectorAll('.fchip[aria-pressed="true"]')].map(c => c.textContent);
+    q.value = on.length ? `Shows tonight: ${on.join(", ")}` : "";
+    q.focus();
+  }
+});
 
 function setBusy(on) {
   busy = on;
@@ -246,6 +296,8 @@ async function ask(text) {
   chat.classList.remove("heroed");
   add("me", text);
   record("me", text);
+  const budget = text.match(BUDGET);
+  if (budget) { prefs.budget = budget[0]; savePrefs(); }
   const wait = add("bot", "<i></i><i></i><i></i>", true);
   wait.classList.add("typing");
   inflight = new AbortController();
@@ -278,7 +330,7 @@ async function ask(text) {
   try {
     const r = await fetch("/api/ask", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ city: citySel.value, question: text, history, speak: speakOn }),
+      body: JSON.stringify({ city: citySel.value, question: text, history, speak: speakOn, prefs }),
       signal: inflight.signal,
     });
     // errors (400/429/500) still answer as plain JSON — only the answer streams
@@ -322,6 +374,13 @@ async function ask(text) {
     if (!done) { retryHint("The answer was cut off.", text); return; }
     history = done.history;
     showFresh(done.crawled);
+    if (done.booking) {
+      const { venue, seats } = done.booking;
+      if (Number.isInteger(seats) && seats > 0) prefs.seats = seats;
+      if (venue) prefs.venues = [venue, ...(prefs.venues || []).filter(v => v !== venue)].slice(0, 3);
+      savePrefs();
+    }
+    if (done.watch) setWatch(done.watch);
     const cls = done.booked ? "bot booked" : "bot";
     // Reached over a tunnel the server won't have opened anything — it can't reach
     // this device's browser — so booking comes back as a link to tap instead.
@@ -418,6 +477,7 @@ function retryHint(message, question) {
 // style times all have to be rewritten or the synthesiser reads them literally —
 // "hash hash one", "Rs one zero five dash two four nine", "zero seven thirty five".
 const plain = (text) => text
+  .replace(/^\s*\[\[show\|([^|\]]*)\|([^|\]]*)\|([^|\]]*)\|.*$/gm, "$1 at $2, $3.")  // a show card
   .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
   .replace(/https?:\/\/\S+/g, "the booking link")  // else it spells the whole URL out, character by character
   .replace(/^\s*[-*]\s+/gm, "")                    // list bullets, so it doesn't say "dash"
@@ -743,6 +803,45 @@ if (motionOK && innerWidth > 700) {
     requestAnimationFrame(tick);
   })();
 }
+
+// ---- "tell me when it opens" ----
+// ponytail: polled only while the app is open (on load + every 30 min). Real push to a
+// closed app needs Web Push (VAPID + encryption deps), stored subscriptions and a cron
+// to wake a sleeping free host — worth it only if people actually use watches.
+function setWatch({ title, stop }) {
+  const city = citySel.value;
+  const i = watches.findIndex(w => w.city === city && w.title.toLowerCase() === title.toLowerCase());
+  if (stop) { if (i >= 0) watches.splice(i, 1); }
+  else if (i < 0) {
+    watches.push({ title, city });
+    if ("Notification" in window && Notification.permission === "default") Notification.requestPermission();
+  }
+  saveWatches();
+}
+
+async function checkWatches() {
+  for (const city of new Set(watches.map(w => w.city))) {
+    const titles = watches.filter(w => w.city === city).map(w => w.title);
+    let open = [];
+    try {
+      const r = await fetch(`/api/watch?city=${encodeURIComponent(city)}&` +
+                            titles.map(t => "t=" + encodeURIComponent(t)).join("&"));
+      if (r.ok) ({ open = [] } = await r.json());
+    } catch { continue; }  // offline or asleep: the next poll tries again
+    const where = citySel.querySelector(`option[value="${city}"]`)?.textContent || city;
+    for (const title of open) {
+      const msg = `${title} is open for booking in ${where}.`;
+      add("hint", msg + " Ask me to book it.");
+      if ("Notification" in window && Notification.permission === "granted")
+        navigator.serviceWorker?.ready.then(sw => sw.showNotification("Today's Plan", { body: msg, icon: "icon.svg" }));
+      const i = watches.findIndex(w => w.city === city && w.title === title);
+      if (i >= 0) watches.splice(i, 1);
+    }
+  }
+  saveWatches();
+}
+checkWatches();
+setInterval(checkWatches, 30 * 60 * 1000);
 
 // past-chats dropdown + restore of the current conversation on first page load.
 // Last in the file: loadChat touches speech state declared further up, and a

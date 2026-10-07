@@ -827,6 +827,23 @@ def test_spoken_summary():
           booktic._split_say("SAY: hi\n\nbody") == ("body", "hi"))
 
 
+def test_watch_and_client_prefs():
+    import server
+    saved = booktic.crawl
+    booktic.crawl = lambda city, ahead=True: ("\n## Resident Evil: Requiem (2026)  — book: https://x\n"
+                                              "- PVR: 07:00 PM Rs200\n")
+    try:
+        check("listed matches a loose title", booktic.listed("hyderabad", ["resident evil"]) == ["resident evil"])
+        check("listed ignores a title not showing", booktic.listed("hyderabad", ["Dune"]) == [])
+    finally:
+        booktic.crawl = saved
+    line = server.client_prefs({"budget": "under ₹200", "seats": 3, "venues": ["PVR", 7, "x" * 500]})
+    check("client prefs carry budget, seats and venues",
+          "under ₹200" in line and "3 tickets" in line and "PVR" in line and "xxx" not in line)
+    check("client prefs drop junk", server.client_prefs({"seats": 99, "budget": ["x"]}) == ""
+          and server.client_prefs("nope") == "")
+
+
 def main():
     real_fetch = booktic.fetch
 
@@ -851,6 +868,7 @@ def main():
     print("prompt scoping"); test_needs_future(); test_crawl_trims_future(install)
     print("provider resilience"); test_provider_stall(); test_error_detail_is_scoped()
     print("spoken summary"); test_spoken_summary()
+    print("watches + client prefs"); test_watch_and_client_prefs()
     print("concurrency"); test_prefs_concurrency(); test_atomic_swap()
 
     booktic.fetch = real_fetch
