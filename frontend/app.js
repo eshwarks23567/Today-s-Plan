@@ -178,14 +178,6 @@ addEventListener("pointerdown", (e) => {
   if (!chatsPanel.hidden && !e.target.closest(".chatsmenu")) closeChats();
 });
 
-// past-chats dropdown + restore of the current conversation on first page load
-(function restore() {
-  refreshChatsMenu();
-  const cur = store.find(c => String(c.id) === localStorage.getItem("booktic.current"));
-  if (!cur) { chat.classList.add("heroed"); return; }
-  loadChat(cur);
-})();
-
 // ---- chat ----
 bindChips();
 citySel.onchange = () => {
@@ -744,3 +736,13 @@ if (motionOK && innerWidth > 700) {
     requestAnimationFrame(tick);
   })();
 }
+
+// past-chats dropdown + restore of the current conversation on first page load.
+// Last in the file: loadChat touches speech state declared further up, and a
+// `let` read before its line runs throws.
+(function restore() {
+  refreshChatsMenu();
+  const cur = store.find(c => String(c.id) === localStorage.getItem("booktic.current"));
+  if (!cur) { chat.classList.add("heroed"); return; }
+  loadChat(cur);
+})();
