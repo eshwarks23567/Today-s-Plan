@@ -227,38 +227,68 @@ const inline = (s) => s
     (_, label, url) => `<a href="${url.replace(/"/g, "&quot;")}" target="_blank" rel="noopener">${label}</a>`)
   .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
 
+// The model often names a movie as a bullet or heading and then gives its card right
+// under it, so the title printed twice. A line that only repeats a card's title goes.
+const bare = (s) => s.replace(/\*\*/g, "").replace(/[:.]\s*$/, "").trim().toLowerCase();
+
 function md(t) {
   const lines = t.replace(/&/g, "&amp;").replace(/</g, "&lt;").split("\n");
-  let html = "", inList = false;
+  const titles = new Set(lines.map(l => l.trim().match(/^\[\[show\|([^|\]]*)/))
+    .filter(Boolean).map(m => bare(m[1])));
+  let html = "", inList = false, inCards = false;
   const closeList = () => { if (inList) { html += "</ul>"; inList = false; } };
+  const closeCards = () => { if (inCards) { html += "</div>"; inCards = false; } };
   for (const raw of lines) {
     const line = raw.trim();
     const card = line.match(/^\[\[show\|(.+)\]\]$/);
-    if (card) { closeList(); html += showCard(card[1].split("|")); continue; }
+    if (card) {
+      closeList();
+      if (!inCards) { html += '<div class="cards">'; inCards = true; }
+      html += showCard(card[1].split("|"));
+      continue;
+    }
     if (line.startsWith("[[")) continue;  // a card still streaming in: draw it once it's whole
+    if (!line) continue;  // a blank line between cards must not split their grid
+    closeCards();
     if (/^-{3,}$/.test(line)) { closeList(); html += "<hr>"; continue; }
     const h = line.match(/^#{2,4}\s+(.*)$/);
+    if (h && titles.has(bare(h[1]))) continue;
     if (h) { closeList(); html += `<h4>${inline(h[1])}</h4>`; continue; }
     const li = line.match(/^[*-]\s+(.*)$/);
+    if (li && titles.has(bare(li[1]))) continue;
     if (li) { if (!inList) { html += "<ul>"; inList = true; } html += `<li>${inline(li[1])}</li>`; continue; }
     closeList();
-    if (line) html += `<p>${inline(line)}</p>`;
+    if (titles.has(bare(line))) continue;
+    html += `<p>${inline(line)}</p>`;
   }
   closeList();
+  closeCards();
   return html;
 }
 
 // [[show|movie|venue|time|BMS price|District price]] -> a card with a Book button.
 // Fields arrive already &/< escaped by md(); quotes still need it for the attributes.
 const lowest = (s) => { const m = (s || "").match(/\d[\d,]*/); return m ? +m[0].replace(/,/g, "") : null; };
+// The listings write prices as "Rs180-250"; people read "₹180–250". Only the figures
+// are kept: the model sometimes leaves other words in the field ("format: Rs50-150").
+const rupees = (s) => {
+  const m = s.match(/(\d[\d,]*)(?:\s*[-–]\s*(\d[\d,]*))?/);
+  return m ? "₹" + m[1] + (m[2] ? "–" + m[2] : "") : s.trim();
+};
+// Time and price are what a show is chosen by, so they lead the card at the largest
+// size; the movie follows, the venue is the grey line.
 function showCard([movie = "", venue = "", time = "", bms = "-", dis = "-"]) {
   const a = lowest(bms), b = lowest(dis);
   const best = a != null && (b == null || a <= b) ? "BookMyShow" : b != null ? "District" : "";
-  const pill = (src, val, n) => n == null ? "" :
-    `<span class="pill${src === best && a != null && b != null && a !== b ? " best" : ""}">${src} <b>${val.trim()}</b></span>`;
+  const price = best === "BookMyShow" ? bms : best === "District" ? dis : "";
+  const other = a != null && b != null
+    ? `<span class="sc-other">${best === "BookMyShow" ? "District " + rupees(dis) : "BookMyShow " + rupees(bms)}`
+      + `${a !== b ? ", so " + best + " is cheaper" : ""}</span>`
+    : "";
   const attr = (s) => s.trim().replace(/"/g, "&quot;");
-  return `<div class="showcard"><div class="sc-what"><b>${movie.trim()}</b><span>${venue.trim()} · ${time.trim()}</span></div>`
-    + `<div class="sc-prices">${pill("BookMyShow", bms, a)}${pill("District", dis, b)}</div>`
+  return `<div class="showcard"><div class="sc-when"><b class="sc-time">${time.trim()}</b>`
+    + (price ? `<span class="sc-price">${rupees(price)} <small>on ${best}</small></span>` : "") + `</div>`
+    + `<b class="sc-movie">${movie.trim()}</b><span class="sc-venue">${venue.trim()}</span>${other}`
     + `<button type="button" class="sc-book" data-movie="${attr(movie)}" data-venue="${attr(venue)}" `
     + `data-time="${attr(time)}" data-src="${best}">Book</button></div>`;
 }
@@ -287,15 +317,18 @@ function setBusy(on) {
   document.querySelectorAll(".chip").forEach(c => c.disabled = on);
 }
 
-async function ask(text) {
+// retry: the question is already on screen and in the saved chat, so it is not added again
+async function ask(text, retry = false) {
   if (busy) return;
   setBusy(true);
   resetSpeech();
   $("hero")?.remove();
   $("gallery")?.remove();
   chat.classList.remove("heroed");
-  add("me", text);
-  record("me", text);
+  if (!retry) {
+    add("me", text);
+    record("me", text);
+  }
   const budget = text.match(BUDGET);
   if (budget) { prefs.budget = budget[0]; savePrefs(); }
   const wait = add("bot", "<i></i><i></i><i></i>", true);
@@ -336,7 +369,7 @@ async function ask(text) {
     // errors (400/429/500) still answer as plain JSON — only the answer streams
     if (!(r.headers.get("content-type") || "").includes("text/event-stream")) {
       const out = await r.json();
-      retryHint("Something went wrong: " + (out.error || r.status), text);
+      retryHint(out.error || `The server answered ${r.status}.`, text);
       return;
     }
     let done = null;
@@ -365,7 +398,7 @@ async function ask(text) {
         summarised = true;
         if (speakOn) say(ev.text);
       } else if (ev.type === "error") {
-        retryHint("Something went wrong: " + ev.error, text);
+        retryHint(ev.error, text);
         return;
       } else if (ev.type === "done") {
         done = ev;
@@ -468,7 +501,7 @@ function retryHint(message, question) {
   const b = document.createElement("button");
   b.className = "chip";
   b.textContent = "Retry";
-  b.onclick = () => { h.remove(); ask(question); };
+  b.onclick = () => { h.remove(); ask(question, true); };
   h.appendChild(b);
 }
 

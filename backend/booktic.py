@@ -859,6 +859,156 @@ def _hold_say(on_token, on_say):
     return feed
 
 
+# The prompt tells the model to respect a stated budget and time, and it often does
+# not: "after 9 PM under Rs200" came back with a 6 PM show and a Rs249 one. Cards are
+# what people tap, so the limits are enforced here in code rather than hoped for.
+_NUMWORD = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+_BUDGET = re.compile(r"\b(?:under|below|within|less than|cheaper than|max(?:imum)?|up ?to|"
+                     r"budget(?: is| of)?)\s*(?:rs\.?|₹|inr)?\s*(\d{2,5})(?!\d|\s*(?:min|hr|hour|km))"
+                     r"(?:\s*for\s+(\d|one|two|three|four|five|six)\b)?", re.I)
+_WHEN = re.compile(r"\b(after|post|later than|before|earlier than)\s+(\d{1,2})(?::(\d{2}))?"
+                   r"\s*([ap])?\.?\s*(?:m\b)?", re.I)
+_CARD = re.compile(r"^\s*\[\[show\|(.*)\]\]\s*$")
+
+
+def _clock(h, m, mer, assume_pm: bool) -> int | None:
+    """Minutes into the evening's day. Shows before 5 AM count as the end of tonight,
+    so "after 9 PM" keeps a 12:30 AM show."""
+    h, m = int(h), int(m or 0)
+    if h > 23 or m > 59 or (mer and not 1 <= h <= 12):
+        return None
+    if mer:
+        h = h % 12 + (12 if mer.lower() == "p" else 0)
+    elif assume_pm and 1 <= h <= 11:
+        h += 12  # ponytail: "after 9" about movies means evening; morning asks need "AM"
+    t = h * 60 + m
+    return t + 1440 if t < 300 else t
+
+
+def show_limits(question: str, history: list[dict]) -> dict:
+    """Per-ticket price ceiling and time window the person stated. A time holds for this
+    question only; a budget holds for the conversation (as the prompt says), latest wins."""
+    lim = {}
+    asked = [question] + [p.get("text", "") for t in reversed(history)
+                          if t.get("role") == "user" for p in t.get("parts", [])]
+    for text in asked:
+        b = _BUDGET.search(text)
+        if b:
+            n = b.group(2)
+            lim["price"] = int(b.group(1)) / (_NUMWORD.get(n.lower()) or int(n) if n else 1)
+            break
+    for w in _WHEN.finditer(question):
+        t = _clock(w.group(2), w.group(3), w.group(4), assume_pm=True)
+        if t is not None:
+            lim["after" if w.group(1).lower() in ("after", "post", "later than") else "before"] = t
+    return lim
+
+
+_SHOWTIME = re.compile(r"^\d{1,2}:\d{2}\s*(?:[ap]\.?m\.?)?$", re.I)
+
+
+def fix_card(line: str) -> str:
+    """Puts a card's fields back in order. The model sometimes shifts them
+    ("|-|9:40 PM|Rs199"), and the page then read 9:40 PM as a Rs9 ticket. The time is
+    found by its shape; whatever is left keeps its order as the two prices."""
+    m = _CARD.match(line)
+    if not m:
+        return line
+    movie, venue, *rest = (m.group(1).split("|") + ["-", "-"])[:5]
+    rest = [r.strip() for r in rest]
+    at = next((i for i, r in enumerate(rest) if _SHOWTIME.match(r)), None)
+    if at is None:
+        return line
+    prices = rest[:at] + rest[at + 1:]
+    return f"[[show|{movie.strip()}|{venue.strip()}|{rest[at]}|{prices[0]}|{prices[1]}]]" \
+        + ("\n" if line.endswith("\n") else "")
+
+
+def card_fits(line: str, lim: dict) -> bool:
+    m = _CARD.match(line)
+    if not m or not lim:
+        return True
+    _, _, when, *prices = (m.group(1).split("|") + ["-"] * 5)[:5]
+    lows = [int(p.group().replace(",", "")) for p in (re.search(r"\d[\d,]*", s) for s in prices) if p]
+    # Under a stated limit, a card with no price or time to check is left out, not
+    # trusted: a priceless "ENE Repeat" card was really Rs249 against a Rs200 budget.
+    if "price" in lim and (not lows or min(lows) > lim["price"]):
+        return False
+    c = re.search(r"(\d{1,2}):(\d{2})\s*([ap])?", when, re.I)
+    t = c and _clock(c.group(1), c.group(2), c.group(3), assume_pm=False)
+    if ("after" in lim or "before" in lim) and (
+            not t or t < lim.get("after", 0) or t > lim.get("before", 10**9)):
+        return False
+    return True
+
+
+def _limit_words(lim: dict) -> str:
+    fmt = lambda t: (datetime.min + timedelta(minutes=t % 1440)).strftime("%I:%M %p").lstrip("0")
+    bits = ([f"under ₹{lim['price']:.0f} a ticket"] if "price" in lim else []) \
+        + ([f"after {fmt(lim['after'])}"] if "after" in lim else []) \
+        + ([f"before {fmt(lim['before'])}"] if "before" in lim else [])
+    return ", ".join(bits)
+
+
+class _CardFilter:
+    """Passes the reply through, dropping [[show]] lines that break the limits. Prose
+    streams straight on; only a line that could be a card is held until it ends."""
+
+    MAX_CARDS = 6  # the prompt asks for at most 6; the model has sent 18
+
+    def __init__(self, lim: dict, on_token=None):
+        self.lim, self.on_token = lim, on_token
+        self.buf, self.passing, self.text, self.fed = "", False, "", False
+        self.kept = self.dropped = self.extra = 0
+
+    def _emit(self, s: str):
+        if s:
+            self.text += s
+            if self.on_token:
+                self.on_token(s)
+
+    def _line(self, line: str) -> str:
+        if not _CARD.match(line):
+            return line
+        line = fix_card(line)
+        if not card_fits(line, self.lim):
+            self.dropped += 1
+        elif self.kept >= self.MAX_CARDS:
+            self.extra += 1
+        else:
+            self.kept += 1
+            return line
+        return ""
+
+    def feed(self, t: str):
+        self.fed = self.fed or bool(t)
+        self.buf += t
+        out = ""
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n", 1)
+            out += line + "\n" if self.passing else self._line(line + "\n")
+            self.passing = False
+        head = self.buf.lstrip()
+        if head and not self.passing and not head.startswith("["):
+            self.passing, out, self.buf = True, out + self.buf, ""
+        elif self.passing:
+            out, self.buf = out + self.buf, ""
+        self._emit(out)
+
+    def finish(self) -> str:
+        self._emit(self.buf if self.passing else self._line(self.buf))
+        self.buf = ""
+        words = _limit_words(self.lim)
+        if self.dropped and not self.kept:
+            self._emit(f"\n\nI couldn't confirm any of the shows I picked are {words}, so I "
+                       "left them out. Try a different time or a higher budget.")
+        elif self.dropped:
+            self._emit(f"\n\nI left out {self.dropped} I couldn't confirm are {words}.")
+        if self.extra:
+            self._emit(f"\n\n{self.extra} more shows are in the listings. Name a cinema or a time to narrow it down.")
+        return self.text.strip()
+
+
 def ask_llm(question: str, listings: str, history: list[dict], tools: list | None = None,
             on_token=None, on_say=None, pref_line: str = ""):
     """Answer grounded in the listings. Returns the reply text — or, when tools are
@@ -924,6 +1074,9 @@ def ask_llm(question: str, listings: str, history: list[dict], tools: list | Non
     system += f"\n\n{listings}"
 
     ask = _ask_gemini if PROVIDER == "gemini" else _ask_openai
+    fit = _CardFilter(show_limits(question, history), on_token)
+    if on_token:
+        on_token = fit.feed
     if on_say and on_token:
         on_token = _hold_say(on_token, on_say)
     out = ask(system, history, question, tools, on_token)
@@ -936,6 +1089,9 @@ def ask_llm(question: str, listings: str, history: list[dict], tools: list | Non
         out = out or said
     if not out.strip():
         raise RuntimeError(f"{PROVIDER} returned an empty answer")
+    if not fit.fed:  # unstreamed, or nothing but a SAY line streamed: filter it whole
+        fit.feed(out)
+    out = fit.finish()  # what was shown is what history keeps, so "the second one" agrees
     # Only now is history touched. If the call above raised, the caller retries with
     # the SAME list, and a pre-appended question would be sent twice — two consecutive
     # user turns, saved to the browser's localStorage for good.

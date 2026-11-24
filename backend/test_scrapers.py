@@ -894,6 +894,72 @@ def test_district_catalog(monkeypatch_fetch):
         check("district_catalog raises when every page fails", "403" in str(e))
 
 
+def test_cards_fit_limits():
+    """The review's real failure: "after 9 PM under Rs200" got a 6 PM show, an 8:05 PM
+    one and a Rs249 one. Cards breaking a stated limit are dropped in code, from the
+    stream and the final text alike, and the reply says so."""
+    lim = booktic.show_limits("Shows after 9 PM under ₹200", [])
+    check("limits read price and time", lim == {"price": 200, "after": 21 * 60})
+    check("a total for two becomes per ticket",
+          booktic.show_limits("under 500 for two", [])["price"] == 250)
+    check("a budget from earlier in the chat still holds",
+          booktic.show_limits("what about later?", [{"role": "user", "parts": [{"text": "budget of 300"}]}]) == {"price": 300})
+    check("minutes are not a budget", booktic.show_limits("under 90 minutes long", []) == {})
+    check("a bare hour means evening", booktic.show_limits("before 6", [])["before"] == 18 * 60)
+
+    reply = "\n".join([
+        "Here are the shows after 9 PM under Rs200:",
+        "[[show|Ramayana|Devi 70MM|6:00 PM|-|Rs100-200]]",
+        "[[show|Aakasamlo Oka Tara|INOX Kachiguda|9:40 PM|-|Rs199]]",
+        "[[show|ENE Repeat|INOX Kachiguda|11:00 PM|-|Rs249]]",
+        "[[show|DNK|INOX Sattva|8:05 PM|-|Rs199-299]]",
+        "[[show|Late One|PVR|12:30 AM|Rs150|-]]",
+        "[[show|Hunger Games|INOX Odeon|10:50 PM|Rs220|Rs149]]",
+        "Enjoy!"])
+    shown = []
+    f = booktic._CardFilter(lim, shown.append)
+    for i in range(0, len(reply), 7):  # arrive in awkward chunks, as a stream does
+        f.feed(reply[i:i + 7])
+    out = f.finish()
+    kept = [l.split("|")[1] for l in out.splitlines() if l.startswith("[[show")]
+    check("only cards inside the limits survive",
+          kept == ["Aakasamlo Oka Tara", "Late One", "Hunger Games"])
+    check("the stream and the final text agree", "".join(shown).strip() == out)
+    check("the reply says what was left out", "left out 3" in out and "after 9:00 PM" in out)
+    check("prose is untouched", out.startswith("Here are the shows") and "Enjoy!" in out)
+
+    none = booktic._CardFilter(lim)
+    none.feed("[[show|Ramayana|Devi|6:00 PM|-|Rs100]]")
+    check("all cards out says nothing fits", "confirm any" in none.finish())
+
+    free = booktic._CardFilter({})
+    free.feed(reply)
+    check("no limits keeps every card", free.finish().count("[[show") == 6)
+
+    # seen live: the time slid into the BookMyShow slot and the page showed a Rs9 ticket
+    check("a shifted card is put back in order",
+          booktic.fix_card("[[show|ENE Repeat|INOX|-|11:00 PM|Rs249]]")
+          == "[[show|ENE Repeat|INOX|11:00 PM|-|Rs249]]")
+    check("a well-formed card is left alone",
+          booktic.fix_card("[[show|DNK|INOX|8:05 PM|-|Rs199]]") == "[[show|DNK|INOX|8:05 PM|-|Rs199]]")
+    shifted = booktic._CardFilter(lim)
+    shifted.feed("[[show|ENE Repeat|INOX|-|11:00 PM|Rs249]]")
+    check("a shifted card over budget is still caught", "[[show" not in shifted.finish())
+
+    unpriced = booktic._CardFilter(lim)
+    unpriced.feed("[[show|ENE Repeat|INOX|11:00 PM|-|-]]")
+    check("under a budget, a card with no price to check is left out", "[[show" not in unpriced.finish())
+    untimed = booktic._CardFilter({"after": 21 * 60})
+    untimed.feed("[[show|DNK|INOX|-|Rs150|-]]")
+    check("under a time limit, a card with no time to check is left out", "[[show" not in untimed.finish())
+
+    many = booktic._CardFilter({})
+    many.feed("\n".join(f"[[show|M{i}|V|9:{i}0 PM|Rs150|-]]" for i in range(8)))
+    out = many.finish()
+    check("more than six cards are capped at six, with a note",
+          out.count("[[show") == 6 and "2 more shows" in out)
+
+
 def main():
     real_fetch = booktic.fetch
 
@@ -909,6 +975,7 @@ def main():
     print("bms_seat_url"); test_bms_seat_url(install)
     print("district deep link"); test_district_seat_url(install)
     print("section"); test_section()
+    print("cards fit limits"); test_cards_fit_limits()
     print("ask_llm history"); test_ask_llm_history()
     print("ask_llm tool calls"); test_ask_llm_tool_call()
     print("agent confirmation"); test_agent_confirms_before_acting()

@@ -245,6 +245,10 @@ class Handler(BaseHTTPRequestHandler):
             listings = booktic.crawl(city, ahead)  # raises ValueError for an unknown city
         except (json.JSONDecodeError, ValueError) as e:
             return self._json(400, {"error": str(e)})
+        except RuntimeError:  # crawl() is the only thing above that reaches the network
+            _log_error()
+            return self._json(503, {"error": "Couldn't load today's listings. The ticket sites "
+                                             "didn't return any shows, so try again in a few minutes."})
         except Exception as e:
             _log_error()
             return self._json(500, {"error": _safe(e)})
