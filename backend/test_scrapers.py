@@ -856,6 +856,44 @@ def test_watch_and_client_prefs():
           and server.client_prefs("nope") == "")
 
 
+def test_district_catalog(monkeypatch_fetch):
+    """District's /movies/ page picks the city from the caller's IP, so a server in
+    Singapore got an empty list. The catalog now comes from the per-language city
+    pages, which have no JSON-LD: the movie cards are parsed directly."""
+    def card(slug, mv, title, city="hyderabad"):
+        return (f'<a href="/movies/{slug}-movie-tickets-in-{city}-MV{mv}"><div class="item-cards">'
+                f' <div class="x"><img src="https://cdn.district.in/{slug}.jpg" alt="{title}" '
+                f'class="y"/><h5>{title}</h5></div></div></a>')
+    pages = {
+        "telugu": card("ramayana", 176276, "Ramayana") + card("dnk", 5, "D&amp;K"),
+        "hindi": card("ramayana", 176276, "Ramayana")  # same movie in two languages
+                 + card("other-city", 9, "Elsewhere", city="kochi"),
+    }
+
+    def router(url):
+        lang = url.rsplit("/", 1)[1].split("-")[0]
+        if lang not in pages:
+            raise RuntimeError("fetch failed (HTTP 404)")
+        return pages[lang]
+    monkeypatch_fetch(router)
+
+    out = booktic.district_catalog("hyderabad")
+    check("district_catalog dedupes a movie listed under two languages", len(out) == 2)
+    check("district_catalog keeps the city-less url district_city_url expects",
+          out[0]["url"] == "https://www.district.in/movies/ramayana-movie-tickets-MV176276")
+    check("district_catalog reads title and poster from the card",
+          out[0]["title"] == "Ramayana" and out[0]["image"].endswith("ramayana.jpg"))
+    check("district_catalog unescapes titles", out[1]["title"] == "D&K")
+    check("district_catalog skips cards for another city", all("Elsewhere" != m["title"] for m in out))
+
+    monkeypatch_fetch(lambda url: (_ for _ in ()).throw(RuntimeError("fetch failed (HTTP 403)")))
+    try:
+        booktic.district_catalog("hyderabad")
+        check("district_catalog raises when every page fails", False)
+    except RuntimeError as e:
+        check("district_catalog raises when every page fails", "403" in str(e))
+
+
 def main():
     real_fetch = booktic.fetch
 
@@ -866,6 +904,7 @@ def main():
     print("itemlist / initial_state"); test_itemlist(); test_initial_state()
     print("bms_showtimes"); test_bms_showtimes(install)
     print("district_showtimes"); test_district_showtimes(install)
+    print("district_catalog"); test_district_catalog(install)
     print("bms_events (single-event regex fallback)"); test_bms_events_single_event_fallback(install)
     print("bms_seat_url"); test_bms_seat_url(install)
     print("district deep link"); test_district_seat_url(install)

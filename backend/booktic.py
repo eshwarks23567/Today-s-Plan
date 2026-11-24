@@ -7,7 +7,7 @@ Usage:
 
 Needs GEMINI_API_KEY env var (free tier: https://aistudio.google.com/apikey).
 """
-import json, os, re, subprocess, sys, threading, time, urllib.request
+import html, json, os, re, subprocess, sys, threading, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -54,6 +54,8 @@ def fetch(url: str, tries: int = 3) -> str:
             problem = f"got a Cloudflare interstitial (HTTP {status})"
         elif not status.startswith("2"):
             problem = f"HTTP {status}"
+            if status == "404":
+                break  # a missing page stays missing; retrying only adds sleeps
         else:
             return body
         if attempt < tries - 1:
@@ -90,10 +92,8 @@ def posters(city: str) -> list[str]:
         # than growing one entry per city per day for as long as the process lives
         for stale in [k for k in _posters if k[1] != key[1]]:
             _posters.pop(stale, None)
-        dcity = DISTRICT_CITY.get(city, city)
         try:
-            movies = [m["image"] for m in
-                      itemlist(fetch(f"https://www.district.in/movies/?city={dcity}")) if m.get("image")]
+            movies = [m["image"] for m in district_catalog(city) if m.get("image")]
         except RuntimeError:
             movies = []
         try:
@@ -229,6 +229,35 @@ def bms_seat_url(buy_url: str, venue: str, time_str: str) -> str | None:
 
 # District calls Delhi-NCR differently from BMS's "ncr" slug
 DISTRICT_CITY = {"ncr": "delhi-ncr"}
+
+
+DISTRICT_LANGS = ("telugu", "hindi", "english", "tamil", "malayalam", "kannada")
+
+
+def district_catalog(city: str) -> list[dict]:
+    """District's movies for a city, from its per-language pages.
+
+    The plain /movies/ page picks the city from the caller's IP and ignores ?city=,
+    so from a Singapore server it lists nothing. These pages carry the city in the
+    path instead. They have no JSON-LD list, so read the movie cards directly."""
+    dcity = DISTRICT_CITY.get(city, city)
+    card = re.compile(r'href="/movies/([a-z0-9-]+)-movie-tickets-in-' + re.escape(dcity) +
+                      r'-MV(\d+)"(?:(?!</a>).){0,1500}?<img src="([^"]+)" alt="([^"]*)"', re.S)
+    movies, failures = {}, []
+    for lang in DISTRICT_LANGS:
+        try:
+            page = fetch(f"https://www.district.in/movies/{lang}-movies-tickets-in-{dcity}")
+        except RuntimeError as e:  # a language a city does not carry is a 404
+            failures.append(str(e))
+            continue
+        for slug, mv_id, image, title in card.findall(page):
+            movies.setdefault(mv_id, {
+                "title": html.unescape(title).strip(),
+                "url": f"https://www.district.in/movies/{slug}-movie-tickets-MV{mv_id}",
+                "image": image})
+    if not movies and failures:
+        raise RuntimeError(f"every District language page failed, e.g. {failures[0]}")
+    return list(movies.values())
 
 
 def district_city_url(movie: dict, city: str) -> str:
@@ -514,21 +543,18 @@ def _bms_day(city: str, movies: list[dict], offset: int, pool) -> list[str]:
 def _build_today(city: str) -> str:
     """Everything that actually moves during a day: today's shows, both sources, events."""
     today_iso = date.today().isoformat()
-    dcity = DISTRICT_CITY.get(city, city)
     why = {}
-    def catalog(name, url):  # one blocked source shouldn't take the other down with it
+    def catalog(name, get):  # one blocked source shouldn't take the other down with it
         try:
-            html = fetch(url)
-            movies = itemlist(html)
-            title = re.search(r"<title>([^<]*)", html)
-            why[name] = f"{len(movies)} movies, {len(html)} bytes, title {title and title.group(1)[:80]!r}"
+            movies = get()
+            why[name] = f"{len(movies)} movies"
             return movies
         except RuntimeError as e:
             why[name] = str(e)
             print(f"  {name} catalog failed: {e}", file=sys.stderr)
             return []
-    bms_movies = catalog("BMS", f"https://in.bookmyshow.com/explore/movies-{city}")
-    district_movies = catalog("District", f"https://www.district.in/movies/?city={dcity}")
+    bms_movies = catalog("BMS", lambda: itemlist(fetch(f"https://in.bookmyshow.com/explore/movies-{city}")))
+    district_movies = catalog("District", lambda: district_catalog(city))
     if not bms_movies and not district_movies:
         raise RuntimeError(f"both sources returned no movies: {why}")
 
