@@ -946,6 +946,15 @@ def test_cards_fit_limits():
     shifted.feed("[[show|ENE Repeat|INOX|-|11:00 PM|Rs249]]")
     check("a shifted card over budget is still caught", "[[show" not in shifted.finish())
 
+    # seen live: cards written as bullets showed as raw markup and skipped the limits
+    bullets = booktic._CardFilter(lim)
+    for chunk in ["- [[show|A|V|9:40 PM|Rs199|-]]\n", "- [[show|B|V|", "11:00 PM|-|Rs249]]\n", "1. [[show|C|V|6:00 PM|-|Rs100]]"]:
+        bullets.feed(chunk)
+    out = bullets.finish()
+    check("bulleted cards are filtered like bare ones and rewritten bare",
+          out.startswith("[[show|A|V|9:40 PM|Rs199|-]]") and "|B|" not in out and "|C|" not in out
+          and "left out 2" in out)
+
     unpriced = booktic._CardFilter(lim)
     unpriced.feed("[[show|ENE Repeat|INOX|11:00 PM|-|-]]")
     check("under a budget, a card with no price to check is left out", "[[show" not in unpriced.finish())

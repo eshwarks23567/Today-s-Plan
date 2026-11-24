@@ -1,4 +1,4 @@
-// BookTic frontend — chat, voice in/out, persistence, hero animation, particles.
+// BookTic frontend — chat, voice in/out, persistence, hero animation, poster orbit.
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 const $ = (id) => document.getElementById(id);
 const chat = $("chat"), q = $("q"), form = $("form"), micBtn = $("mic"),
@@ -225,7 +225,10 @@ const inline = (s) => s
   // touch quotes, and an unescaped " here could break out of the href attribute
   .replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g,
     (_, label, url) => `<a href="${url.replace(/"/g, "&quot;")}" target="_blank" rel="noopener">${label}</a>`)
-  .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+  // a card written mid-sentence was never checked against the limits: drop it, never show markup
+  .replace(/\[\[show\|[^\]]*\]\]/g, "")
+  .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+  .replace(/\*([^*\n]+)\*/g, "$1");  // the model's *italic* asides showed their asterisks; plain text reads fine
 
 // The model often names a movie as a bullet or heading and then gives its card right
 // under it, so the title printed twice. A line that only repeats a card's title goes.
@@ -233,21 +236,24 @@ const bare = (s) => s.replace(/\*\*/g, "").replace(/[:.]\s*$/, "").trim().toLowe
 
 function md(t) {
   const lines = t.replace(/&/g, "&amp;").replace(/</g, "&lt;").split("\n");
-  const titles = new Set(lines.map(l => l.trim().match(/^\[\[show\|([^|\]]*)/))
-    .filter(Boolean).map(m => bare(m[1])));
+  // a card may arrive behind a bullet ("- [[show|...]]"); it is still a card
+  const CARD = /^(?:[-*]|\d+\.)?\s*\[\[show\|(.+)\]\]$/;
+  const titles = new Set(lines.map(l => l.trim().match(CARD))
+    .filter(Boolean).map(m => bare(m[1].split("|")[0])));
   let html = "", inList = false, inCards = false;
   const closeList = () => { if (inList) { html += "</ul>"; inList = false; } };
   const closeCards = () => { if (inCards) { html += "</div>"; inCards = false; } };
   for (const raw of lines) {
     const line = raw.trim();
-    const card = line.match(/^\[\[show\|(.+)\]\]$/);
+    const card = line.match(CARD);
     if (card) {
       closeList();
       if (!inCards) { html += '<div class="cards">'; inCards = true; }
       html += showCard(card[1].split("|"));
       continue;
     }
-    if (line.startsWith("[[")) continue;  // a card still streaming in: draw it once it's whole
+    // a card still streaming in, bare or bulleted: draw it once it's whole
+    if (/^(?:[-*]|\d+\.)?\s*\[\[/.test(line)) continue;
     if (!line) continue;  // a blank line between cards must not split their grid
     closeCards();
     if (/^-{3,}$/.test(line)) { closeList(); html += "<hr>"; continue; }
@@ -733,14 +739,14 @@ function revealHero() {
     node.replaceChild(frag, n);
   });
   split(h1);
-  anime({ targets: "#hero .overline", opacity: [0, 1],
-          easing: "easeOutExpo", duration: 500 });
-  anime({ targets: ".ch", translateY: [22, 0], opacity: [0, 1],
-          easing: "easeOutExpo", duration: 600, delay: anime.stagger(14, { start: 100 }) });
-  anime({ targets: "#hero p", opacity: [0, 1], translateY: [10, 0],
-          easing: "easeOutExpo", duration: 500, delay: 450 });
-  anime({ targets: ".chip", opacity: [0, 1], translateY: [10, 0],
-          easing: "easeOutExpo", duration: 400, delay: anime.stagger(50, { start: 600 }) });
+  // one curve for the whole app, the same as --ease in style.css
+  const ease = "cubicBezier(.22, 1, .36, 1)";
+  anime({ targets: ".ch", translateY: [12, 0], opacity: [0, 1],
+          easing: ease, duration: 500, delay: anime.stagger(14, { start: 100 }) });
+  anime({ targets: "#hero p", opacity: [0, 1], translateY: [8, 0],
+          easing: ease, duration: 400, delay: 450 });
+  anime({ targets: ".chip", opacity: [0, 1], translateY: [8, 0],
+          easing: ease, duration: 400, delay: anime.stagger(50, { start: 600 }) });
 }
 if ($("hero")) revealHero();
 
@@ -805,37 +811,6 @@ function startOrbit() {
 }
 buildGallery();
 startOrbit();
-
-// ---- particle backdrop (desktop only: a per-frame canvas repaint next to the
-// orbiting gallery is a real battery cost on a phone, for decoration) ----
-if (motionOK && innerWidth > 700) {
-  const cv = $("particles"), ctx = cv.getContext("2d");
-  let dots = [];
-  const resize = () => {
-    cv.width = innerWidth; cv.height = innerHeight;
-    dots = Array.from({ length: Math.min(40, innerWidth / 32) }, () => ({
-      x: Math.random() * cv.width, y: Math.random() * cv.height,
-      r: Math.random() * 1.3 + .4,
-      vx: (Math.random() - .5) * .15, vy: (Math.random() - .5) * .15,
-      a: Math.random() * .18 + .04,
-      red: Math.random() < .12,
-    }));
-  };
-  resize();
-  addEventListener("resize", resize);
-  (function tick() {
-    ctx.clearRect(0, 0, cv.width, cv.height);
-    for (const d of dots) {
-      d.x = (d.x + d.vx + cv.width) % cv.width;
-      d.y = (d.y + d.vy + cv.height) % cv.height;
-      ctx.beginPath();
-      ctx.arc(d.x, d.y, d.r, 0, 7);
-      ctx.fillStyle = d.red ? `rgba(226,55,68,${d.a})` : `rgba(255,255,255,${d.a * .7})`;
-      ctx.fill();
-    }
-    requestAnimationFrame(tick);
-  })();
-}
 
 // ---- "tell me when it opens" ----
 // ponytail: polled only while the app is open (on load + every 30 min). Real push to a

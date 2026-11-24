@@ -1,4 +1,5 @@
-/* BookTic — design tokens: 8pt spacing, 12px/10px radii, one accent + one semantic green */
+/* Today's Plan — design tokens: 4px grid, 12px/10px radii, one neutral ramp.
+   Red is the ticket-stub red and only marks where you act: send, Book, a selection. */
 :root {
   --bg: #0B0C0E;
   --surface: #141518;
@@ -11,12 +12,13 @@
   --green: #2BB673;
   --r: 12px;
   --r-ctl: 10px;
+  --raised: #26282E;
+  --line-strong: rgba(255, 255, 255, .22);
   --shadow: 0 8px 24px rgba(0, 0, 0, .35);
-  --ease: cubic-bezier(.25, .6, .35, 1);
-  /* type roles: display / body / labels */
+  --ease: cubic-bezier(.22, 1, .36, 1);
+  /* two faces: Satoshi for the interface, Clash Display for the wordmark and headline */
   --font-display: "Clash Display", "Segoe UI", sans-serif;
   --font-body: "Satoshi", "Segoe UI", sans-serif;
-  --font-label: "Space Grotesk", "Segoe UI", sans-serif;
 }
 * { box-sizing: border-box; margin: 0; }
 html, body { height: 100%; }
@@ -39,13 +41,13 @@ header {
 }
 /* the wordmark is a button (starts a new chat) — strip the UA chrome, keep the type */
 .wordmark {
-  font-family: var(--font-display); font-size: 20px; font-weight: 700;
+  font-family: var(--font-display); font-size: 20px; font-weight: 600;
   letter-spacing: 0; margin-right: auto; white-space: nowrap;
   background: none; border: 0; padding: 0; color: var(--text);
   transition: opacity .15s var(--ease);
 }
 .wordmark:hover { opacity: .8; }
-.wordmark span { color: var(--accent); }
+.wordmark span { color: var(--accent-hover); } /* the lighter red clears 4.5:1 on the header */
 
 /* past chats: a disclosure panel rather than a <select>, so each row can carry
    its own delete button — an <option> cannot hold one */
@@ -66,7 +68,7 @@ header {
 .chatstrigger svg { width: 10px; height: 6px; flex: none; transition: transform .15s var(--ease); }
 .chatstrigger[aria-expanded="true"] svg { transform: rotate(180deg); }
 .chatspanel {
-  position: absolute; top: calc(100% + 6px); right: 24px; z-index: 20;
+  position: absolute; top: calc(100% + 8px); right: 24px; z-index: 20;
   width: min(320px, calc(100vw - 32px));
   max-height: min(60vh, 420px); overflow-y: auto;
   padding: 4px;
@@ -104,8 +106,7 @@ select {
 select:hover { border-color: rgba(255, 255, 255, .2); }
 select option { background: var(--surface-2); }
 
-/* particle backdrop */
-#particles { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+/* the chat layers sit above the fixed poster gallery */
 #chat, header, .composer { position: relative; z-index: 1; }
 /* the header owns a dropdown, so it has to stack above the chat log — equal
    z-index would hand the win to #chat for coming later in the document */
@@ -130,8 +131,10 @@ header { z-index: 5; }
 /* while the hero is up, let clicks fall through the chat layer to the gallery */
 #chat.heroed { pointer-events: none; }
 #chat.heroed #hero { pointer-events: auto; }
+/* a neutral scrim in the page's own colour, so the headline stays readable over
+   the orbiting posters: not a colour wash */
 #hero {
-  background: radial-gradient(closest-side, rgba(11, 12, 14, .92) 55%, transparent);
+  background: radial-gradient(closest-side, rgba(11, 12, 14, .92) 55%, transparent); /* taste-skill-ignore */
   border-radius: 50%;
 }
 @media (max-width: 600px) { .circular-gallery img { width: 64px; height: 92px; } }
@@ -153,18 +156,12 @@ header { z-index: 5; }
 
 /* hero */
 #hero { margin: auto; text-align: center; padding: 24px 0; }
-#hero .overline {
-  font-family: var(--font-label);
-  font-size: 12px; font-weight: 500; letter-spacing: .16em; text-transform: uppercase;
-  color: var(--text-dim); margin-bottom: 16px;
-}
 #hero h1 {
   font-family: var(--font-display);
-  font-size: clamp(30px, 5.5vw, 52px); line-height: 1.06;
-  font-weight: 600; letter-spacing: -.01em;
+  font-size: clamp(32px, 5.5vw, 52px); line-height: 1.06;
+  font-weight: 500; letter-spacing: -.02em;
   max-width: 640px; margin-inline: auto;
 }
-#hero h1 .accent { color: var(--accent); }
 #hero p { font-size: 15px; color: var(--text-dim); max-width: 460px; margin: 20px auto 32px; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
 .chip {
@@ -173,41 +170,38 @@ header { z-index: 5; }
   border-radius: var(--r-ctl); padding: 8px 16px;
   transition: border-color .15s var(--ease), color .15s var(--ease), background .15s var(--ease);
 }
-.chip:hover { border-color: rgba(255, 255, 255, .22); color: var(--text); background: var(--surface); }
+.chip:hover { border-color: var(--line-strong); color: var(--text); background: var(--surface); }
 .chip:disabled { opacity: .5; cursor: default; }
 
 /* messages */
 .msg {
-  max-width: min(85%, 560px); padding: 12px 18px; line-height: 1.65;
+  max-width: min(85%, 560px); padding: 12px 16px; line-height: 1.65;
   overflow-wrap: break-word; border-radius: var(--r);
 }
 /* the whole of what animate.css was loaded for; the reduced-motion block below
    already neutralises it, so no JS gate is needed either */
 @keyframes popIn { from { opacity: 0; transform: translateY(8px); } }
 .msg, .hint { animation: popIn .32s var(--ease) both; }
-.me { margin-left: auto; color: #fff; background: #C42F3A; font-weight: 500; } /* deeper accent: white text clears 4.5:1 AA */
+/* your own words sit on a raised neutral: red is kept for the things you press */
+.me { margin-left: auto; color: var(--text); background: var(--raised); font-weight: 500; }
 .bot { margin-right: auto; background: var(--surface); border: 1px solid var(--line); }
 /* agent took a real-world action — mark the reply as a handoff receipt */
 .bot.booked { border-color: rgba(226, 55, 68, .45); }
 .bot.booked::before {
-  content: "Agent action · payment stays with you";
+  content: "Opened for you, payment stays with you";
   display: block; margin-bottom: 8px;
-  font-family: var(--font-label); font-size: 11px; line-height: 16px;
-  letter-spacing: .06em; text-transform: uppercase; color: var(--accent);
+  font-size: 13px; line-height: 20px; font-weight: 500; color: var(--accent-hover);
 }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-.bot h4 {
-  margin: 16px 0 4px; font-family: var(--font-label); font-size: 11.5px; font-weight: 500;
-  letter-spacing: .1em; text-transform: uppercase; color: var(--text-dim);
-}
+.bot h4 { margin: 16px 0 4px; font-size: 13px; font-weight: 600; color: var(--text-dim); }
 .bot h4:first-child { margin-top: 0; }
 .bot b { font-weight: 600; color: #fff; }
 .bot p { margin: 8px 0; }
 .bot p:first-child { margin-top: 0; }
-.bot ul { margin: 8px 0; padding-left: 18px; }
+.bot ul { margin: 8px 0; padding-left: 20px; }
 .bot li { margin: 4px 0; }
-.bot li::marker { color: var(--accent); }
-.bot hr { margin: 14px 0; border: 0; border-top: 1px solid var(--line); }
+.bot li::marker { color: var(--text-dim); }
+.bot hr { margin: 16px 0; border: 0; border-top: 1px solid var(--line); }
 .bot a {
   display: inline-block; margin-top: 8px;
   font-size: 13px; font-weight: 600; color: var(--text); text-decoration: none;
@@ -221,11 +215,11 @@ header { z-index: 5; }
 #chat > .msg.bot:has(.cards) { width: 100%; max-width: min(100%, 880px); }
 .bot .cards {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-  gap: 8px; margin: 10px 0;
+  gap: 8px; margin: 12px 0;
 }
 .showcard {
   display: grid; grid-template-columns: 1fr auto; column-gap: 12px; align-content: start;
-  padding: 12px 14px; line-height: 1.4;
+  padding: 12px 16px; line-height: 1.4;
   background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-ctl);
 }
 .showcard > :not(.sc-book) { grid-column: 1; min-width: 0; }
@@ -238,22 +232,23 @@ header { z-index: 5; }
 .sc-book {
   grid-column: 2; grid-row: 1 / span 4; align-self: start;
   font-size: 13px; font-weight: 600; color: var(--text);
-  background: transparent; border: 1px solid rgba(255, 255, 255, .22);
+  background: transparent; border: 1px solid var(--line-strong);
   border-radius: var(--r-ctl); padding: 8px 16px; cursor: pointer;
   transition: background .15s var(--ease), border-color .15s var(--ease), color .15s var(--ease);
 }
 .sc-book:hover, .sc-book:focus-visible { background: var(--accent); border-color: var(--accent); color: #fff; }
-.sc-book:active { transform: translateY(1px); }
+.sc-book:active, .chip:active, .fchip:active, .send:active { transform: scale(.97); }
 
-/* filter toggles under the hero chips: they build a question instead of sending one */
-.filters { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin-top: 16px; }
+/* filter toggles under the hero chips: they build a question instead of sending one.
+   Same family as the chips, one step smaller; a dashed border read as disabled. */
+.filters { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 16px; }
 .fchip {
-  font-family: var(--font-label); font-size: 12px; color: var(--text-dim);
-  background: transparent; border: 1px dashed var(--line); border-radius: 999px; padding: 6px 12px;
-  transition: border-color .15s var(--ease), color .15s var(--ease);
+  font-size: 13px; color: var(--text-dim);
+  background: transparent; border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px;
+  transition: border-color .15s var(--ease), color .15s var(--ease), background .15s var(--ease);
 }
-.fchip:hover { color: var(--text); border-color: rgba(255, 255, 255, .22); }
-.fchip[aria-pressed="true"] { color: #fff; border: 1px solid var(--accent); background: rgba(226, 55, 68, .15); }
+.fchip:hover { color: var(--text); border-color: var(--line-strong); }
+.fchip[aria-pressed="true"] { color: var(--text); border-color: var(--accent); background: var(--surface-2); }
 
 .hint { margin-inline: auto; text-align: center; font-size: 13px; color: var(--text-dim); }
 
@@ -274,7 +269,8 @@ form { display: flex; gap: 8px; align-items: center; max-width: 720px; margin-in
   border-radius: var(--r); padding: 4px 4px 4px 16px;
   transition: border-color .15s var(--ease);
 }
-.inputwrap:focus-within { border-color: var(--accent); }
+/* the input is focused almost all the time, so a red ring here read as an error */
+.inputwrap:focus-within { border-color: var(--line-strong); }
 input[type=text] {
   flex: 1; min-width: 0; background: none; border: 0; outline: 0;
   color: var(--text); font: inherit; padding: 10px 0;

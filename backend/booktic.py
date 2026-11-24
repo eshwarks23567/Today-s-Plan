@@ -868,7 +868,8 @@ _BUDGET = re.compile(r"\b(?:under|below|within|less than|cheaper than|max(?:imum
                      r"(?:\s*for\s+(\d|one|two|three|four|five|six)\b)?", re.I)
 _WHEN = re.compile(r"\b(after|post|later than|before|earlier than)\s+(\d{1,2})(?::(\d{2}))?"
                    r"\s*([ap])?\.?\s*(?:m\b)?", re.I)
-_CARD = re.compile(r"^\s*\[\[show\|(.*)\]\]\s*$")
+# the model sometimes lists cards as bullets ("- [[show|...]]"); those are cards too
+_CARD = re.compile(r"^\s*(?:[-*]|\d+\.)?\s*\[\[show\|(.*)\]\]\s*$")
 
 
 def _clock(h, m, mer, assume_pm: bool) -> int | None:
@@ -908,17 +909,16 @@ _SHOWTIME = re.compile(r"^\d{1,2}:\d{2}\s*(?:[ap]\.?m\.?)?$", re.I)
 
 
 def fix_card(line: str) -> str:
-    """Puts a card's fields back in order. The model sometimes shifts them
-    ("|-|9:40 PM|Rs199"), and the page then read 9:40 PM as a Rs9 ticket. The time is
-    found by its shape; whatever is left keeps its order as the two prices."""
+    """Rewrites a card in the one form the page draws. The model sometimes shifts the
+    fields ("|-|9:40 PM|Rs199", which the page read as a Rs9 ticket) or writes the card
+    as a bullet. The time is found by its shape; what is left keeps its order as the
+    two prices."""
     m = _CARD.match(line)
     if not m:
         return line
-    movie, venue, *rest = (m.group(1).split("|") + ["-", "-"])[:5]
+    movie, venue, *rest = (m.group(1).split("|") + ["-", "-", "-"])[:5]
     rest = [r.strip() for r in rest]
-    at = next((i for i, r in enumerate(rest) if _SHOWTIME.match(r)), None)
-    if at is None:
-        return line
+    at = next((i for i, r in enumerate(rest) if _SHOWTIME.match(r)), 0)
     prices = rest[:at] + rest[at + 1:]
     return f"[[show|{movie.strip()}|{venue.strip()}|{rest[at]}|{prices[0]}|{prices[1]}]]" \
         + ("\n" if line.endswith("\n") else "")
@@ -989,7 +989,8 @@ class _CardFilter:
             out += line + "\n" if self.passing else self._line(line + "\n")
             self.passing = False
         head = self.buf.lstrip()
-        if head and not self.passing and not head.startswith("["):
+        # a line that may turn out to be a card, bare or bulleted, waits for its end
+        if head and not self.passing and not (head[0] in "[-*" or head[0].isdigit()):
             self.passing, out, self.buf = True, out + self.buf, ""
         elif self.passing:
             out, self.buf = out + self.buf, ""
