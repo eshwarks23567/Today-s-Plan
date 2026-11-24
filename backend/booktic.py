@@ -518,8 +518,10 @@ def _build_today(city: str) -> str:
     why = {}
     def catalog(name, url):  # one blocked source shouldn't take the other down with it
         try:
-            movies = itemlist(fetch(url))
-            why[name] = f"{len(movies)} movies"
+            html = fetch(url)
+            movies = itemlist(html)
+            title = re.search(r"<title>([^<]*)", html)
+            why[name] = f"{len(movies)} movies, {len(html)} bytes, title {title and title.group(1)[:80]!r}"
             return movies
         except RuntimeError as e:
             why[name] = str(e)
