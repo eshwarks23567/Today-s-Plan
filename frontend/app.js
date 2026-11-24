@@ -299,13 +299,70 @@ function showCard([movie = "", venue = "", time = "", bms = "-", dis = "-"]) {
     + `data-time="${attr(time)}" data-src="${best}">Book</button></div>`;
 }
 
+// ---- day plans ----
+// The planner sends its plan as data as well as text: drawn as a timeline here, with a
+// booking action on every stop and the alternatives one tap away. The data rides along
+// in the card, so a saved chat can still swap alternatives after a reload.
+const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const inr = (n) => "₹" + Math.round(n).toLocaleString("en-IN");
+
+function planStop(s) {
+  let action = "";
+  if (s.show) {
+    const d = s.show;
+    action = `<button type="button" class="sc-book" data-movie="${esc(d.movie)}" data-venue="${esc(d.venue)}" `
+      + `data-time="${esc(d.time)}" data-src="${esc(d.source)}" data-seats="${d.seats}">Book seats</button>`;
+  } else if (s.link) {
+    action = `<a class="plan-link" href="${esc(s.link.url)}" target="_blank" rel="noopener">${esc(s.link.label)}</a>`;
+  } else if (s.kind === "visit") {
+    const where = encodeURIComponent(`${s.title}, ${s.detail.split(" · ")[0]}`);
+    action = `<a class="plan-link" href="https://www.google.com/maps/search/?api=1&amp;query=${where}" target="_blank" rel="noopener">Map</a>`;
+  }
+  const cost = s.cost ? inr(s.cost) : s.kind === "visit" ? "Entry price not listed" : "";
+  return `<li class="stop"><time>${esc(s.at)}</time><div class="stop-body">`
+    + `<span class="stop-label">${esc(s.label)} · until ${esc(s.until)}${s.offer ? ` · <span class="stop-offer">${esc(s.offer)}</span>` : ""}</span>`
+    + `<b class="stop-title">${esc(s.title)}</b><span class="stop-detail">${esc(s.detail)}</span>`
+    + (cost ? `<span class="stop-cost">${cost}</span>` : "") + `</div>${action}</li>`;
+}
+
+function planCard(plan, pick = 0) {
+  const opt = plan.options[pick];
+  const share = plan.budget ? Math.min(100, (opt.cost / plan.budget) * 100) : 0;
+  const alts = plan.options.map((o, i) => i === pick ? "" :
+    `<button type="button" class="chip plan-alt" data-pick="${i}">${esc(o.stops.map(s => s.title).join(" → "))} · ${inr(o.cost)}</button>`).join("");
+  const notes = plan.notes.join("; ");
+  return `<div class="plan" data-plan="${esc(JSON.stringify(plan))}">`
+    + `<div class="plan-head"><div><b>Plan for ${plan.people} · ${esc(plan.where)}</b><span>Done around ${esc(opt.ends)}</span></div>`
+    + `<div class="plan-total"><b>${inr(opt.cost)}</b><span>${plan.budget ? `of ${inr(plan.budget)}` : "about, in total"}</span></div></div>`
+    + (plan.budget ? `<div class="plan-bar" role="img" aria-label="${Math.round(share)}% of the budget"><i style="width:${share}%"></i></div>` : "")
+    + `<ol class="plan-stops">${opt.stops.map(planStop).join("")}</ol>`
+    + (alts ? `<div class="plan-alts"><span>Other ways to spend it</span>${alts}</div>` : "")
+    + `<details class="plan-notes"><summary>How this was worked out</summary><p>${esc(notes[0].toUpperCase() + notes.slice(1))}.</p></details>`
+    + `</div>`;
+}
+
+// A question back from the planner ("how many people?") comes with its answers as buttons.
+const replies = (choices) =>
+  `<div class="replies">${choices.map(c => `<button type="button" class="chip reply">${esc(c)}</button>`).join("")}</div>`;
+
 // One listener for cards and filters, so buttons restored from a saved chat (stored as
 // HTML, no handlers) work too.
 chat.addEventListener("click", (e) => {
   const book = e.target.closest(".sc-book");
   if (book && !busy) {
-    const d = book.dataset, n = prefs.seats || 2;
+    const d = book.dataset, n = +d.seats || prefs.seats || 2;   // a plan books for its own group
     return ask(`Book ${n} tickets for ${d.movie} at ${d.venue}, ${d.time}${d.src ? ` on ${d.src}` : ""}`);
+  }
+  const reply = e.target.closest(".reply");
+  if (reply && !busy) {
+    reply.parentElement.remove();   // answered: the buttons go, the answer shows as your message
+    return ask(reply.textContent);
+  }
+  const alt = e.target.closest(".plan-alt");
+  if (alt) {
+    const box = alt.closest(".plan");
+    box.outerHTML = planCard(JSON.parse(box.dataset.plan), +alt.dataset.pick);
+    return;
   }
   const f = e.target.closest(".fchip");
   if (f) {
@@ -425,7 +482,9 @@ async function ask(text, retry = false) {
     const cls = done.booked ? "bot booked" : "bot";
     // Reached over a tunnel the server won't have opened anything — it can't reach
     // this device's browser — so booking comes back as a link to tap instead.
-    let html = md(done.answer);
+    // a day plan is drawn as its timeline card; a question back carries its answers as buttons
+    let html = done.plan ? planCard(done.plan) : md(done.answer);
+    if (Array.isArray(done.choices) && done.choices.length) html += replies(done.choices);
     // BookMyShow blocks the crawler, so its prices are usually missing from the cards.
     // Its city page still opens in the person's own browser: offer that to compare.
     const bmsPriced = /^\s*\[\[show\|[^|]*\|[^|]*\|[^|]*\|[^|\]]*\d/m.test(done.answer);

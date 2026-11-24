@@ -281,12 +281,14 @@ class Handler(BaseHTTPRequestHandler):
             # A day plan is computed, not generated: times, tables and money are worked
             # out in planner.py, and its reply needs no model call at all.
             if planner.wants_plan(question, history):
-                answer = planner.respond(city, question, history, listings)
+                reply = planner.respond(city, question, history, listings)
+                answer = reply["text"]
                 history += [{"role": "user", "parts": [{"text": question}]},
                             {"role": "model", "parts": [{"text": answer}]}]
                 send(type="token", text=answer)
+                # plan: drawn as a timeline card; choices: quick-reply buttons under a question
                 send(type="done", answer=answer, history=history, booked=False, url=None,
-                     crawled=booktic.crawled_at(city))
+                     crawled=booktic.crawled_at(city), plan=reply.get("plan"), choices=reply.get("choices"))
                 return
             answer, booked, url = agent.handle(
                 question, history, listings, city,

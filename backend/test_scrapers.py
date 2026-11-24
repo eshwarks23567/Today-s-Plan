@@ -1100,6 +1100,14 @@ def test_planner():
     check("planner: nothing over budget", tight and all(p["cost"] <= 2000 for p in tight))
     check("planner: an impossible budget gives no plan", planner.schedule({**req, "budget": 300}, shows, [rest], []) == [])
 
+    # no area named: a show and a table in the same neighbourhood beat a cross-town pairing
+    far = {**rest, "name": "Far Away", "locality": "Kukatpally, Hyderabad", "rating": "4.6",
+           "url": "https://www.district.in/dining/hyderabad/far-away"}
+    anywhere = planner.read_request("hyderabad", "plan for 2 from 5 pm till 11:30 pm", afternoon)
+    top = planner.schedule(anywhere, shows, [far, rest], [])[0]["stops"]
+    check("planner: with no area, it keeps the movie and the meal in the same neighbourhood",
+          next(s for s in top if s["kind"] == "meal")["obj"]["name"] == "Krishnapatnam")
+
     garden = {"name": "NTR Gardens", "kind": "see", "district": "Central", "hours": "2-8:30PM", "price": "₹20",
               "open_close": (14 * 60, 20 * 60 + 30), "lat": None, "lon": None}
     sight_req = planner.read_request("hyderabad", "plan our evening for 2 with some sightseeing and dinner, no movie", afternoon)
@@ -1115,13 +1123,25 @@ def test_planner():
     real = (dining.restaurants, places.near)
     try:
         dining.restaurants, places.near = (lambda city, area=None: [rest]), (lambda city, area: [])
-        check("planner: asks for the group size first", planner.respond("hyderabad", "plan my evening", [], listings, afternoon) == planner.PEOPLE_Q)
+        asked = planner.respond("hyderabad", "plan my evening", [], listings, afternoon)
+        check("planner: asks for the group size first, with quick replies",
+              asked == {"text": planner.PEOPLE_Q, "choices": planner.PEOPLE_CHOICES})
+        check("planner: every quick reply reads back as a group size",
+              [planner.people(c) for c in planner.PEOPLE_CHOICES] == [1, 2, 3, 4, 5, 6])
         hist = [{"role": "user", "parts": [{"text": "plan my evening near banjara hills"}]},
                 {"role": "model", "parts": [{"text": planner.PEOPLE_Q}]}]
         reply = planner.respond("hyderabad", "2", hist, listings, afternoon)
-        check("planner: the answer to the question picks the original request back up", reply.startswith("**Plan for 2 · Banjara Hills"))
+        check("planner: the answer to the question picks the original request back up", reply["text"].startswith("**Plan for 2 · Banjara Hills"))
+        plan = reply["plan"]
+        first = plan["options"][0]
+        check("planner: the plan card data matches the text",
+              plan["people"] == 2 and plan["where"] == "Banjara Hills" and first["cost"] == 330 * 2 + 1280
+              and [s["kind"] for s in first["stops"]] == ["movie", "meal"]
+              and first["stops"][0]["show"] == {"movie": "Ramayana", "venue": "INOX GVK One, Banjara Hills Hyderabad",
+                                                 "time": "6:30 PM", "source": "District", "seats": 2}
+              and first["stops"][1]["link"]["url"] == rest["url"] and first["stops"][1]["offer"] == "Flat 20% OFF")
         check("planner: later days are declined honestly",
-              "only plan today" in planner.respond("hyderabad", "plan our weekend for 2", [], listings, afternoon))
+              "only plan today" in planner.respond("hyderabad", "plan our weekend for 2", [], listings, afternoon)["text"])
     finally:
         dining.restaurants, places.near = real
 

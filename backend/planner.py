@@ -163,7 +163,9 @@ def schedule(req: dict, shows: list[dict], restaurants: list[dict], sights: list
         idle = sum(b["at"] - (a["at"] + a["len"]) for a, b in zip(stops, stops[1:]))
         near = sum(8 for s in stops if area and area in s["where"].lower())
         visited = any(s["kind"] == "visit" for s in stops)
-        score = (float(meal["obj"]["rating"] or 3.5) * 10 if meal else 0) + near - idle / 10 \
+        # stops close together beat a cross-town trip, most of all when no area was named
+        close = sum(10 for a, b in zip(stops, stops[1:]) if travel(a["where"], b["where"]) == NEAR_MIN)
+        score = (float(meal["obj"]["rating"] or 3.5) * 10 if meal else 0) + near + close - idle / 10 \
             + (25 if visited and req["visit"] else 10 if visited else 0)
         if meal and (m := re.search(r"(\d+)%", meal["obj"].get("offer") or "")):
             score += int(m.group(1)) / 3
@@ -249,7 +251,19 @@ def _stop_lines(s: dict, n: int) -> list[str]:
             f"[[show|{o['movie']}|{o['venue']}|{o['time']}|{bms}|{dis}]]"]
 
 
+def _notes(req: dict, best: dict) -> list[str]:
+    n = req["people"]
+    notes = ["meal prices are District's cost for two scaled to your group, before taxes and drinks",
+             "travel times are rough (15 min within a neighbourhood, 40 across town)"]
+    if req["budget"]:
+        notes.insert(0, f"I read ₹{req['budget']:,} as the budget for all {n}" + (" (your per-person figure × the group)" if req["budget_each"] else ""))
+    if any(s["kind"] == "visit" for s in best["stops"]):
+        notes.append("opening hours come from Wikivoyage and skip weekday closures, so check before you go")
+    return notes
+
+
 def render(req: dict, chosen: list[dict], city: str) -> str:
+    """The plan as chat text: what the conversation history keeps and the voice reads."""
     n = req["people"]
     where = (req["area"] or city).title()
     best = chosen[0]
@@ -264,18 +278,45 @@ def render(req: dict, chosen: list[dict], city: str) -> str:
         for p in chosen[1:]:
             parts = [f"{_clock_text(s['at'])} {s['obj'].get('name') or s['obj'].get('movie')}" for s in p["stops"]]
             lines.append(f"- {' → '.join(parts)} — about ₹{p['cost']:,}")
-    notes = ["meal prices are District's cost for two scaled to your group, before taxes and drinks",
-             "travel times are rough (15 min within a neighbourhood, 40 across town)"]
-    if req["budget"]:
-        notes.insert(0, f"I read ₹{req['budget']:,} as the budget for all {n}" + (" (your per-person figure × the group)" if req["budget_each"] else ""))
-    if any(s["kind"] == "visit" for s in best["stops"]):
-        notes.append("opening hours come from Wikivoyage and skip weekday closures, so check before you go")
-    lines += ["", "Notes: " + "; ".join(notes) + "."]
+    lines += ["", "Notes: " + "; ".join(_notes(req, best)) + "."]
     return "\n".join(lines)
 
 
-def respond(city: str, question: str, history: list, listings: str, now: datetime | None = None) -> str:
-    """The planner's whole reply: a question back, or a plan, or why there is none."""
+def _stop_card(s: dict, n: int) -> dict:
+    """One stop as data for the page's plan card."""
+    o = s["obj"]
+    stop = {"kind": s["kind"], "at": _clock_text(s["at"]), "until": _clock_text(s["at"] + s["len"]), "cost": s["cost"]}
+    if s["kind"] == "visit":
+        stop.update(label="Visit", title=o["name"], detail=" · ".join(b for b in (o["district"], o["hours"] and f"open {o['hours']}",
+                                                                                   o["price"] and f"entry {o['price']}") if b))
+    elif s["kind"] == "meal":
+        stop.update(label="Lunch" if s["at"] < 15 * 60 else "Early dinner" if s["at"] < 18 * 60 + 30 else "Dinner",
+                    title=o["name"], offer=s["offer"] or None,
+                    detail=f"{o['cuisines']} · ₹{o['cost_for_two']} for two · {o['locality']}",
+                    link={"label": "Book table", "url": o["url"]})
+    else:
+        stop.update(label="Movie", title=o["movie"],
+                    detail=f"{o['venue']}{' · ' + o['format'] if o['format'] else ''} · ₹{o['price']} × {n}",
+                    show={"movie": o["movie"], "venue": o["venue"], "time": o["time"], "source": o["source"], "seats": n})
+    return stop
+
+
+def plan_data(req: dict, chosen: list[dict], city: str) -> dict:
+    """The same plan as structured data, so the page can draw it as a timeline and
+    swap in an alternative without asking again."""
+    def option(p):
+        last = p["stops"][-1]
+        return {"cost": p["cost"], "ends": _clock_text(last["at"] + last["len"]), "stops": [_stop_card(s, req["people"]) for s in p["stops"]]}
+    return {"people": req["people"], "where": (req["area"] or city).title(), "budget": req["budget"],
+            "options": [option(p) for p in chosen], "notes": _notes(req, chosen[0])}
+
+
+PEOPLE_CHOICES = ["Just me", "2", "3", "4", "5", "6"]
+
+
+def respond(city: str, question: str, history: list, listings: str, now: datetime | None = None) -> dict:
+    """The planner's whole reply: {"text"} always, plus "choices" (quick replies) when it
+    asks a question back, or "plan" (structured, for the page's plan card) when it plans."""
     text = question
     if _asked_people(history) and len(history) >= 2:
         # the reply answers our question ("2", "four of us"): read the size from it alone,
@@ -284,12 +325,12 @@ def respond(city: str, question: str, history: list, listings: str, now: datetim
         text = history[-2]["parts"][0]["text"] + " " + (f"for {n} people" if n else question)
     req = read_request(city, text, now)
     if req["people"] is None:
-        return PEOPLE_Q
+        return {"text": PEOPLE_Q, "choices": PEOPLE_CHOICES}
     if req["tomorrow"]:
-        return ("I can only plan today: District, the source the plans are built from, lists today's shows "
-                "and tables only. Ask me in the morning and I'll plan the day.")
+        return {"text": "I can only plan today: District, the source the plans are built from, lists today's shows "
+                        "and tables only. Ask me in the morning and I'll plan the day."}
     if req["start"] + 60 > req["end"]:
-        return "There isn't enough of today left in that window to plan anything. Try a later end time."
+        return {"text": "There isn't enough of today left in that window to plan anything. Try a later end time."}
     try:
         rows = dining.restaurants(city, req["area"])
     except RuntimeError:
@@ -298,6 +339,7 @@ def respond(city: str, question: str, history: list, listings: str, now: datetim
     plans = schedule(req, parse_shows(listings), rows, sights)
     if not plans:
         why = f"within ₹{req['budget']:,}" if req["budget"] else "in that time window"
-        return (f"I couldn't fit a plan for {req['people']} {why} with today's shows and open tables"
-                f"{' near ' + req['area'].title() if req['area'] else ''}. Try a wider window, a higher budget or another area.")
-    return render(req, pick(plans), city)
+        return {"text": f"I couldn't fit a plan for {req['people']} {why} with today's shows and open tables"
+                        f"{' near ' + req['area'].title() if req['area'] else ''}. Try a wider window, a higher budget or another area."}
+    chosen = pick(plans)
+    return {"text": render(req, chosen, city), "plan": plan_data(req, chosen, city)}
