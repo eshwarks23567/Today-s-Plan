@@ -955,6 +955,14 @@ def test_cards_fit_limits():
           out.startswith("[[show|A|V|9:40 PM|Rs199|-]]") and "|B|" not in out and "|C|" not in out
           and "left out 2" in out)
 
+    # seen live: with BookMyShow blocked, District's prices came back "on BookMyShow"
+    listing = "# BookMyShow — 2026-11-24 (today), 0 movies\n# District — 2026-11-24 (today), 25 movies"
+    check("listed_sources reads which sellers have movies", booktic.listed_sources(listing) == {"District"})
+    check("a price filed under a seller with no listings moves to the one that has them",
+          booktic.fix_card("[[show|A|V|9:40 PM|Rs199|-]]", {"District"}) == "[[show|A|V|9:40 PM|-|Rs199]]")
+    check("with both sellers listed, prices stay where the model put them",
+          booktic.fix_card("[[show|A|V|9:40 PM|Rs199|-]]", {"District", "BookMyShow"}) == "[[show|A|V|9:40 PM|Rs199|-]]")
+
     unpriced = booktic._CardFilter(lim)
     unpriced.feed("[[show|ENE Repeat|INOX|11:00 PM|-|-]]")
     check("under a budget, a card with no price to check is left out", "[[show" not in unpriced.finish())
@@ -969,6 +977,34 @@ def test_cards_fit_limits():
           out.count("[[show") == 6 and "2 more shows" in out)
 
 
+def test_district_future(monkeypatch_fetch):
+    """District lists later days on each movie page as ?fromdate= links. Only those
+    dates, and only up to the crawl's last day, are fetched; each day's booking url
+    keeps its date so the seat-map link resolves against that day's sessions."""
+    from datetime import date, timedelta
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    far = (date.today() + timedelta(days=30)).isoformat()
+    base = "https://www.district.in/movies/dnk-movie-tickets-in-hyderabad-MV5"
+    fetched = []
+
+    def router(url):
+        fetched.append(url)
+        if url == base:
+            return f'<a href="/movies/x?fromdate={tomorrow}"></a><a href="/movies/x?fromdate={far}"></a>'
+        return district_movie_html(f"{tomorrow}T10:00", 180.0)  # 3:30 PM IST
+    monkeypatch_fetch(router)
+
+    movie = {"title": "DNK", "url": "https://www.district.in/movies/dnk-movie-tickets-MV5"}
+    last = (date.today() + timedelta(days=4)).isoformat()
+    out = booktic.district_future(movie, "hyderabad", last)
+    check("district_future returns the offered later day", list(out) == [tomorrow])
+    check("district_future skips dates past the crawl window", not any(far in u for u in fetched))
+    book, rows = out.get(tomorrow, ("", []))
+    check("district_future keeps the date in the booking url", book == f"{base}?fromdate={tomorrow}")
+    check("district_future reads that day's session",
+          rows and rows[0]["sessions"][0]["time"] == "3:30 PM")
+
+
 def main():
     real_fetch = booktic.fetch
 
@@ -980,6 +1016,7 @@ def main():
     print("bms_showtimes"); test_bms_showtimes(install)
     print("district_showtimes"); test_district_showtimes(install)
     print("district_catalog"); test_district_catalog(install)
+    print("district later days"); test_district_future(install)
     print("bms_events (single-event regex fallback)"); test_bms_events_single_event_fallback(install)
     print("bms_seat_url"); test_bms_seat_url(install)
     print("district deep link"); test_district_seat_url(install)

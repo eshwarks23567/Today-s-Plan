@@ -353,15 +353,17 @@ async function ask(text, retry = false) {
   // a hung server would otherwise leave the dots spinning forever
   let timedOut = false;
   const limit = setTimeout(() => { timedOut = true; inflight?.abort(); }, 120000);
-  let bubble = null, full = "", pending = false, summarised = false;
+  let bubble = null, full = "", pending = false, summarised = false, final = false;
   // Re-render the accumulated markdown at most once a frame: tokens arrive far
   // faster than the eye resolves, and md() on every one of them is wasted work.
+  // A frame still pending when the final answer lands must not overwrite it: it
+  // used to, wiping anything appended at the end (the BookMyShow link).
   const paint = () => {
     if (pending) return;
     pending = true;
     requestAnimationFrame(() => {
       pending = false;
-      if (!bubble) return;
+      if (!bubble || final) return;
       bubble.innerHTML = md(full);
       chat.scrollTop = chat.scrollHeight;
     });
@@ -424,10 +426,18 @@ async function ask(text, retry = false) {
     // Reached over a tunnel the server won't have opened anything — it can't reach
     // this device's browser — so booking comes back as a link to tap instead.
     let html = md(done.answer);
+    // BookMyShow blocks the crawler, so its prices are usually missing from the cards.
+    // Its city page still opens in the person's own browser: offer that to compare.
+    const bmsPriced = /^\s*\[\[show\|[^|]*\|[^|]*\|[^|]*\|[^|\]]*\d/m.test(done.answer);
+    if (html.includes("showcard") && !bmsPriced) {
+      html += `<a class="also" href="https://in.bookmyshow.com/explore/movies-${encodeURIComponent(citySel.value)}" `
+        + `target="_blank" rel="noopener">Compare on BookMyShow →</a>`;
+    }
     if (done.url) {
       const label = done.url.includes("/seat-layout/") ? "Open seat map" : "Open booking page";
       html += `<a href="${done.url.replace(/"/g, "&quot;")}" target="_blank" rel="noopener">${label} →</a>`;
     }
+    final = true;
     if (bubble) {
       bubble.className = "msg " + cls;
       bubble.innerHTML = html;

@@ -301,16 +301,41 @@ def _district_page(url: str, today_iso: str) -> list[dict]:
     return out
 
 
+def _district_rows(url: str, iso: str) -> list[dict]:
+    rows: dict[str, list] = {}
+    for s in _district_page(url, iso):
+        rows.setdefault(s["venue"], []).append(
+            {"time": s["time"], "min": s["min"], "max": s["max"], "attrs": s["attrs"]})
+    return [{"venue": v, "sessions": ss} for v, ss in rows.items()]
+
+
 def district_showtimes(movie: dict, city: str, today_iso: str) -> list[dict]:
     """District: all venues/sessions/prices for one movie today."""
     url = district_city_url(movie, city)
-    rows: dict[str, list] = {}
-    for s in _district_page(url, today_iso):
-        rows.setdefault(s["venue"], []).append(
-            {"time": s["time"], "min": s["min"], "max": s["max"], "attrs": s["attrs"]})
+    rows = _district_rows(url, today_iso)
     if rows:
         movie["book"] = url
-    return [{"venue": v, "sessions": ss} for v, ss in rows.items()]
+    return rows
+
+
+def district_future(movie: dict, city: str, last_iso: str) -> dict[str, tuple[str, list]]:
+    """Later days for one movie: {date: (booking url, rows)}. The movie page links
+    every date District has opened as ?fromdate=, so only those are fetched; asking
+    for every day up to DAYS would waste a request per movie for each closed day."""
+    url = district_city_url(movie, city)
+    try:
+        page = fetch(url)
+    except RuntimeError:
+        return {}
+    today = date.today().isoformat()
+    out = {}
+    for iso in sorted(set(re.findall(r"fromdate=(\d{4}-\d{2}-\d{2})", page))):
+        if today < iso <= last_iso:
+            book = f"{url}?fromdate={iso}"
+            rows = _district_rows(book, iso)
+            if rows:
+                out[iso] = (book, rows)
+    return out
 
 
 def district_seat_url(book_url: str, venue: str, time_str: str,
@@ -325,7 +350,9 @@ def district_seat_url(book_url: str, venue: str, time_str: str,
         return None
     content_id = m.group(1)
     vkey = venue.split(":")[0].strip().lower()
-    for s in _district_page(book_url, today_iso or date.today().isoformat()):
+    # a later day's booking url carries its date; its sessions are filtered by it
+    day = re.search(r"fromdate=(\d{4}-\d{2}-\d{2})", book_url)
+    for s in _district_page(book_url, today_iso or (day and day.group(1)) or date.today().isoformat()):
         if s["time"] != time_str or not (s["mcd"] and s["enc"]):
             continue
         if vkey and vkey not in s["venue"].lower():
@@ -560,7 +587,7 @@ def _build_today(city: str) -> str:
 
     lines = [f"Movie showtimes in {city}, crawled at {datetime.now():%H:%M} (today refreshes "
              f"every ~20 min, later dates hourly). Each section is labelled with its own date (see "
-             "headings); District covers today only. The same cinema can appear in both sources "
+             "headings); District lists later days only once it opens booking for them. The same cinema can appear in both sources "
              "with different prices — treat them as competing ticket sellers."]
     with ThreadPoolExecutor(max_workers=8) as pool:
         lines += _bms_day(city, bms_movies, 0, pool)
@@ -578,12 +605,35 @@ def _build_today(city: str) -> str:
 
 
 def _build_future(city: str) -> str:
-    """Tomorrow onwards — the bulk of the fetches, and the part that barely changes."""
-    movies = itemlist(fetch(f"https://in.bookmyshow.com/explore/movies-{city}"))
+    """Tomorrow onwards — the bulk of the fetches, and the part that barely changes.
+    Like today, one blocked source must not take the other down: BookMyShow 403ing
+    here once made every question about a later day fail."""
+    try:
+        bms = itemlist(fetch(f"https://in.bookmyshow.com/explore/movies-{city}"))
+    except RuntimeError as e:
+        print(f"  BMS future catalog failed: {e}", file=sys.stderr)
+        bms = []
+    try:
+        dis = district_catalog(city)
+    except RuntimeError as e:
+        print(f"  District future catalog failed: {e}", file=sys.stderr)
+        dis = []
+    if not bms and not dis:
+        raise RuntimeError("both sources returned no movies for later dates")
+    last = (date.today() + timedelta(days=DAYS - 1)).isoformat()
     lines = []
     with ThreadPoolExecutor(max_workers=8) as pool:
+        dis_days = list(pool.map(lambda mv: district_future(mv, city, last), dis))
         for offset in range(1, DAYS):
-            lines += _bms_day(city, movies, offset, pool)
+            if bms:
+                lines += _bms_day(city, bms, offset, pool)
+            day = date.today() + timedelta(days=offset)
+            got = [(mv, d[day.isoformat()]) for mv, d in zip(dis, dis_days) if day.isoformat() in d]
+            if got:
+                lines.append(f"\n# District — {day.isoformat()} ({day:%A}), {len(got)} movies")
+                for mv, (book, rows) in got:
+                    lines += section({**mv, "book": book}, rows)
+                print(f"  District {day.isoformat()}: {len(got)} movies", file=sys.stderr)
     return "\n".join(lines)
 
 
@@ -908,19 +958,33 @@ def show_limits(question: str, history: list[dict]) -> dict:
 _SHOWTIME = re.compile(r"^\d{1,2}:\d{2}\s*(?:[ap]\.?m\.?)?$", re.I)
 
 
-def fix_card(line: str) -> str:
+def listed_sources(listings: str) -> set[str]:
+    """Which sellers actually have movies in this snapshot, from its section headings."""
+    return {src for src, n in re.findall(r"^# (BookMyShow|District) — .*?, (\d+) movies", listings, re.M)
+            if int(n) > 0}
+
+
+def fix_card(line: str, sources: set | None = None) -> str:
     """Rewrites a card in the one form the page draws. The model sometimes shifts the
     fields ("|-|9:40 PM|Rs199", which the page read as a Rs9 ticket) or writes the card
     as a bullet. The time is found by its shape; what is left keeps its order as the
-    two prices."""
+    two prices. Given the sources really in the listings, a price filed under a seller
+    with no listings belongs to the other one: with BookMyShow blocked, the model kept
+    labelling District's prices "on BookMyShow", and Book went to the wrong site."""
     m = _CARD.match(line)
     if not m:
         return line
     movie, venue, *rest = (m.group(1).split("|") + ["-", "-", "-"])[:5]
     rest = [r.strip() for r in rest]
     at = next((i for i, r in enumerate(rest) if _SHOWTIME.match(r)), 0)
-    prices = rest[:at] + rest[at + 1:]
-    return f"[[show|{movie.strip()}|{venue.strip()}|{rest[at]}|{prices[0]}|{prices[1]}]]" \
+    bms, dis = (rest[:at] + rest[at + 1:])[:2]
+    priced = lambda s: bool(re.search(r"\d", s))
+    if sources is not None:
+        if "BookMyShow" not in sources and priced(bms):
+            bms, dis = "-", dis if priced(dis) else bms
+        if "District" not in sources and priced(dis):
+            bms, dis = bms if priced(bms) else dis, "-"
+    return f"[[show|{movie.strip()}|{venue.strip()}|{rest[at]}|{bms}|{dis}]]" \
         + ("\n" if line.endswith("\n") else "")
 
 
@@ -956,8 +1020,8 @@ class _CardFilter:
 
     MAX_CARDS = 6  # the prompt asks for at most 6; the model has sent 18
 
-    def __init__(self, lim: dict, on_token=None):
-        self.lim, self.on_token = lim, on_token
+    def __init__(self, lim: dict, on_token=None, sources: set | None = None):
+        self.lim, self.on_token, self.sources = lim, on_token, sources
         self.buf, self.passing, self.text, self.fed = "", False, "", False
         self.kept = self.dropped = self.extra = 0
 
@@ -970,7 +1034,7 @@ class _CardFilter:
     def _line(self, line: str) -> str:
         if not _CARD.match(line):
             return line
-        line = fix_card(line)
+        line = fix_card(line, self.sources)
         if not card_fits(line, self.lim):
             self.dropped += 1
         elif self.kept >= self.MAX_CARDS:
@@ -1004,7 +1068,9 @@ class _CardFilter:
             self._emit(f"\n\nI couldn't confirm any of the shows I picked are {words}, so I "
                        "left them out. Try a different time or a higher budget.")
         elif self.dropped:
-            self._emit(f"\n\nI left out {self.dropped} I couldn't confirm are {words}.")
+            one = self.dropped == 1
+            self._emit(f"\n\nI left out {self.dropped} more {'show' if one else 'shows'} I couldn't "
+                       f"confirm {'is' if one else 'are'} {words}.")
         if self.extra:
             self._emit(f"\n\n{self.extra} more shows are in the listings. Name a cinema or a time to narrow it down.")
         return self.text.strip()
@@ -1075,7 +1141,8 @@ def ask_llm(question: str, listings: str, history: list[dict], tools: list | Non
     system += f"\n\n{listings}"
 
     ask = _ask_gemini if PROVIDER == "gemini" else _ask_openai
-    fit = _CardFilter(show_limits(question, history), on_token)
+    # no headings at all (a hand-made listing) means unknown, not "no sources"
+    fit = _CardFilter(show_limits(question, history), on_token, listed_sources(listings) or None)
     if on_token:
         on_token = fit.feed
     if on_say and on_token:

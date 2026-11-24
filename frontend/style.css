@@ -210,6 +210,9 @@ header { z-index: 5; }
   transition: border-color .15s var(--ease), background .15s var(--ease);
 }
 .bot a:hover { border-color: var(--accent); background: #22242A; }
+/* a way out to a second seller, quieter than a booking link */
+.bot a.also { margin-right: 8px; background: transparent; color: var(--text-dim); }
+.bot a.also:hover { color: var(--text); border-color: var(--line-strong); background: transparent; }
 /* show cards: time and price first, then the movie, the venue in grey, one Book.
    An answer with cards gets the width to lay them out two or three across. */
 #chat > .msg.bot:has(.cards) { width: 100%; max-width: min(100%, 880px); }
