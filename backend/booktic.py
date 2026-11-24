@@ -318,24 +318,9 @@ def district_showtimes(movie: dict, city: str, today_iso: str) -> list[dict]:
     return rows
 
 
-def district_future(movie: dict, city: str, last_iso: str) -> dict[str, tuple[str, list]]:
-    """Later days for one movie: {date: (booking url, rows)}. The movie page links
-    every date District has opened as ?fromdate=, so only those are fetched; asking
-    for every day up to DAYS would waste a request per movie for each closed day."""
-    url = district_city_url(movie, city)
-    try:
-        page = fetch(url)
-    except RuntimeError:
-        return {}
-    today = date.today().isoformat()
-    out = {}
-    for iso in sorted(set(re.findall(r"fromdate=(\d{4}-\d{2}-\d{2})", page))):
-        if today < iso <= last_iso:
-            book = f"{url}?fromdate={iso}"
-            rows = _district_rows(book, iso)
-            if rows:
-                out[iso] = (book, rows)
-    return out
+# District covers today only. Its movie pages do link later days, but only as
+# ?fromdate= query urls, and its robots.txt disallows every url with a query string
+# ("Disallow: /*?"). Respect that rather than read around it.
 
 
 def district_seat_url(book_url: str, venue: str, time_str: str,
@@ -350,9 +335,7 @@ def district_seat_url(book_url: str, venue: str, time_str: str,
         return None
     content_id = m.group(1)
     vkey = venue.split(":")[0].strip().lower()
-    # a later day's booking url carries its date; its sessions are filtered by it
-    day = re.search(r"fromdate=(\d{4}-\d{2}-\d{2})", book_url)
-    for s in _district_page(book_url, today_iso or (day and day.group(1)) or date.today().isoformat()):
+    for s in _district_page(book_url, today_iso or date.today().isoformat()):
         if s["time"] != time_str or not (s["mcd"] and s["enc"]):
             continue
         if vkey and vkey not in s["venue"].lower():
@@ -587,7 +570,7 @@ def _build_today(city: str) -> str:
 
     lines = [f"Movie showtimes in {city}, crawled at {datetime.now():%H:%M} (today refreshes "
              f"every ~20 min, later dates hourly). Each section is labelled with its own date (see "
-             "headings); District lists later days only once it opens booking for them. The same cinema can appear in both sources "
+             "headings); District covers today only. The same cinema can appear in both sources "
              "with different prices — treat them as competing ticket sellers."]
     with ThreadPoolExecutor(max_workers=8) as pool:
         lines += _bms_day(city, bms_movies, 0, pool)
@@ -605,35 +588,23 @@ def _build_today(city: str) -> str:
 
 
 def _build_future(city: str) -> str:
-    """Tomorrow onwards — the bulk of the fetches, and the part that barely changes.
-    Like today, one blocked source must not take the other down: BookMyShow 403ing
-    here once made every question about a later day fail."""
+    """Tomorrow onwards, from BookMyShow only (District covers today only).
+
+    With BookMyShow unreachable this says so instead of raising: raising here once made
+    every question about a later day fail outright, when "I can only see today" is the
+    true and useful answer."""
     try:
         bms = itemlist(fetch(f"https://in.bookmyshow.com/explore/movies-{city}"))
     except RuntimeError as e:
         print(f"  BMS future catalog failed: {e}", file=sys.stderr)
         bms = []
-    try:
-        dis = district_catalog(city)
-    except RuntimeError as e:
-        print(f"  District future catalog failed: {e}", file=sys.stderr)
-        dis = []
-    if not bms and not dis:
-        raise RuntimeError("both sources returned no movies for later dates")
-    last = (date.today() + timedelta(days=DAYS - 1)).isoformat()
+    if not bms:
+        return ("\n# Later dates: no listings. BookMyShow, the only source for days after "
+                "today, is unreachable right now, and District lists today only.")
     lines = []
     with ThreadPoolExecutor(max_workers=8) as pool:
-        dis_days = list(pool.map(lambda mv: district_future(mv, city, last), dis))
         for offset in range(1, DAYS):
-            if bms:
-                lines += _bms_day(city, bms, offset, pool)
-            day = date.today() + timedelta(days=offset)
-            got = [(mv, d[day.isoformat()]) for mv, d in zip(dis, dis_days) if day.isoformat() in d]
-            if got:
-                lines.append(f"\n# District — {day.isoformat()} ({day:%A}), {len(got)} movies")
-                for mv, (book, rows) in got:
-                    lines += section({**mv, "book": book}, rows)
-                print(f"  District {day.isoformat()}: {len(got)} movies", file=sys.stderr)
+            lines += _bms_day(city, bms, offset, pool)
     return "\n".join(lines)
 
 

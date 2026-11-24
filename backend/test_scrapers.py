@@ -977,32 +977,160 @@ def test_cards_fit_limits():
           out.count("[[show") == 6 and "2 more shows" in out)
 
 
+def test_dining(monkeypatch_fetch):
+    """District dining pages embed one record per restaurant inside the Next.js payload,
+    quotes escaped. Shape mirrors the live Banjara Hills page (24 Nov 2026)."""
+    import dining
+    card = {
+        "id": "19562237", "title": {"text": "Angry Sardar"},
+        "action": {"type": "NAVIGATE", "url": "https://www.district.in/dining/hyderabad/angry-sardar-banjara-hills"},
+        "tags": [{"id": "offer_0", "label": "Flat 45% OFF", "style": "PRIMARY"}],
+        "serviceability": {"type": "OPEN", "title": "Open"},
+        "slotBooking": {"state": "SLOTS", "slots": [{"slotId": "s0", "title": "7:00 PM"}, {"slotId": "s1", "title": "10:30 PM"}]},
+        "tracking": {"rating": "4.4", "cuisines": "North Indian", "costForTwo": 2000, "distanceKm": "1.7km",
+                     "locality": "Banjara Hills, Hyderabad"},
+    }
+    closed = {**card, "id": "2", "title": {"text": "Late Cafe"}, "tags": [], "serviceability": {"type": "CLOSED"},
+              "slotBooking": {}, "action": {"url": "https://www.district.in/dining/hyderabad/late-cafe?ref=x"}}
+    compact = json.dumps([card, card, closed], separators=(",", ":"))   # the live page has no spaces
+    page = ('<script>self.__next_f.push([1,"' + compact.replace('"', '\\"')
+            + ' {\\"id\\":\\"9\\",\\"title\\":{\\"text\\":\\"Not a restaurant\\"}}"])</script>')
+    rows = dining.parse_restaurants(page)
+    check("dining: reads each restaurant once, skips look-alike objects", [r["name"] for r in rows] == ["Angry Sardar", "Late Cafe"])
+    a = rows[0]
+    check("dining: cost, offer, rating, locality and table times",
+          (a["cost_for_two"], a["offer"], a["rating"], a["locality"], a["tables"], a["open"])
+          == (2000, "Flat 45% OFF", "4.4", "Banjara Hills, Hyderabad", ["7:00 PM", "10:30 PM"], True))
+    check("dining: a closed place with no offer says so", (rows[1]["open"], rows[1]["offer"]) == (False, None))
+    check("dining: booking links never carry a query string", all("?" not in r["url"] for r in rows))
+    text = dining.dining_section(rows, "Banjara Hills, Hyderabad")
+    check("dining: the section gives the model price, offer and the booking link",
+          "₹2000 for two" in text and "offer: Flat 45% OFF" in text and "book: https://www.district.in/dining/hyderabad/angry-sardar" in text)
+
+    xml = ("<urlset><url><loc>https://www.district.in/dining/hyderabad/hyderabad-city/banjara-hills-restaurants</loc></url>"
+           "<url><loc>https://www.district.in/dining/hyderabad/restaurants</loc></url>"
+           "<url><loc>https://www.district.in/dining/bangalore/south/jp-nagar-restaurants</loc></url></urlset>")
+    by_city = dining.parse_areas(xml)
+    check("dining: area pages by city from the sitemap", by_city == {
+        "hyderabad": {"banjara hills": "https://www.district.in/dining/hyderabad/hyderabad-city/banjara-hills-restaurants"},
+        "bangalore": {"jp nagar": "https://www.district.in/dining/bangalore/south/jp-nagar-restaurants"}})
+    dining._areas.update(at=time.time(), by_city={**by_city, "hyderabad": {**by_city["hyderabad"], "hills": "x"}})
+    check("dining: the longest neighbourhood name in the question wins",
+          dining.find_area("hyderabad", "dinner near Banjara Hills tonight") == "banjara hills")
+    check("dining: bengaluru maps to District's 'bangalore'", "jp nagar" in dining.areas("bengaluru"))
+    check("dining: only food questions pull restaurants",
+          dining.wants_food("dinner after the movie") and not dining.wants_food("what's playing tonight?"))
+
+
 def test_district_future(monkeypatch_fetch):
-    """District lists later days on each movie page as ?fromdate= links. Only those
-    dates, and only up to the crawl's last day, are fetched; each day's booking url
-    keeps its date so the seat-map link resolves against that day's sessions."""
-    from datetime import date, timedelta
-    tomorrow = (date.today() + timedelta(days=1)).isoformat()
-    far = (date.today() + timedelta(days=30)).isoformat()
-    base = "https://www.district.in/movies/dnk-movie-tickets-in-hyderabad-MV5"
+    """District's robots.txt disallows every url with a query string, and its later
+    days exist only as ?fromdate= links, so later dates come from BookMyShow alone.
+    With BookMyShow blocked, the later-dates part says so instead of raising, which
+    once failed every question about tomorrow."""
     fetched = []
 
     def router(url):
         fetched.append(url)
-        if url == base:
-            return f'<a href="/movies/x?fromdate={tomorrow}"></a><a href="/movies/x?fromdate={far}"></a>'
-        return district_movie_html(f"{tomorrow}T10:00", 180.0)  # 3:30 PM IST
+        raise RuntimeError("fetch failed (HTTP 403)")
     monkeypatch_fetch(router)
+    out = booktic._build_future("hyderabad")
+    check("later dates with BookMyShow blocked are a note, not an error", "no listings" in out)
+    check("no url with a query string is ever fetched for later dates", not any("?" in u for u in fetched))
 
-    movie = {"title": "DNK", "url": "https://www.district.in/movies/dnk-movie-tickets-MV5"}
-    last = (date.today() + timedelta(days=4)).isoformat()
-    out = booktic.district_future(movie, "hyderabad", last)
-    check("district_future returns the offered later day", list(out) == [tomorrow])
-    check("district_future skips dates past the crawl window", not any(far in u for u in fetched))
-    book, rows = out.get(tomorrow, ("", []))
-    check("district_future keeps the date in the booking url", book == f"{base}?fromdate={tomorrow}")
-    check("district_future reads that day's session",
-          rows and rows[0]["sessions"][0]["time"] == "3:30 PM")
+
+def test_planner():
+    """The planner does the times and the money in code. These pin the things the model
+    got wrong when asked: overlaps, tables outside their slots, going over budget."""
+    from datetime import datetime
+    import dining, places, planner
+    afternoon = datetime(2026, 11, 24, 16, 0)
+
+    check("planner: group size from words", [planner.people(t) for t in
+          ["plan for 4 people", "we are 3", "dinner for two", "just me tonight", "date night", "4", "plan my evening"]]
+          == [4, 3, 2, 1, 2, 4, None])
+    check("planner: '9 pm' and '₹200' are not group sizes", planner.people("plan from 9 pm for 200") is None)
+    r = planner.read_request("hyderabad", "plan my evening for 3, ₹1000 each, from 6 pm till 11", afternoon)
+    check("planner: window, per-person budget times the group",
+          (r["people"], r["budget"], r["budget_each"], r["start"], r["end"]) == (3, 3000, True, 18 * 60, 23 * 60))
+    r = planner.read_request("hyderabad", "plan for 2 under ₹2500", afternoon)
+    check("planner: a plain budget is for the whole group, window starts now", (r["budget"], r["start"]) == (2500, 16 * 60))
+    check("planner: wants a plan, or is answering the people question",
+          planner.wants_plan("plan my saturday evening", []) and not planner.wants_plan("what's on tonight", [])
+          and planner.wants_plan("4", [{"role": "user", "parts": [{"text": "plan my evening"}]},
+                                       {"role": "model", "parts": [{"text": planner.PEOPLE_Q}]}]))
+
+    listings = "\n".join([
+        "# BookMyShow — 2026-11-24 (today), 0 movies",
+        "# District — 2026-11-24 (today), 2 movies",
+        "## Ramayana  — book: https://www.district.in/movies/ramayana-movie-tickets-in-hyderabad-MV1",
+        "- INOX GVK One, Banjara Hills Hyderabad [3D]: 6:30 PM Rs330-385, 10:20 PM Rs330",
+        "- PVR Preston, Gachibowli, Hyderabad: 9:00 PM Rs250 2D",
+        "# Dining (source: District) — Banjara Hills, 1 restaurants",
+        "- Not A Show — 7:00 PM Rs100",
+    ])
+    shows = planner.parse_shows(listings)
+    check("planner: reads today's sessions only, not the dining section",
+          [(s["venue"].split(",")[0], s["time"], s["price"], s["source"]) for s in shows]
+          == [("INOX GVK One", "6:30 PM", 330, "District"), ("INOX GVK One", "10:20 PM", 330, "District"),
+              ("PVR Preston", "9:00 PM", 250, "District")])
+    check("planner: an offer comes off the bill", planner.meal_cost({"cost_for_two": 2000, "offer": "Flat 25% OFF"}, 3) == (2250, "Flat 25% OFF"))
+
+    rest = {"name": "Krishnapatnam", "url": "https://www.district.in/dining/hyderabad/krishnapatnam-jubilee-hills",
+            "rating": "4.4", "cuisines": "South Indian", "cost_for_two": 1600, "locality": "Banjara Hills, Hyderabad",
+            "offer": "Flat 20% OFF", "open": True, "tables": ["5:00 PM", "6:30 PM", "8:00 PM", "9:00 PM", "10:00 PM"]}
+    req = planner.read_request("hyderabad", "plan for 2 near banjara hills from 5 pm till 11:30 pm", afternoon)
+    plans = planner.schedule(req, shows, [rest], [])
+    ok = True
+    for p in plans:
+        st = p["stops"]
+        for a, b in zip(st, st[1:]):
+            ok &= a["at"] + a["len"] <= b["at"]               # no overlap
+        for s in st:
+            ok &= req["start"] <= s["at"] and s["at"] + s["len"] <= req["end"]
+            if s["kind"] == "meal":
+                ok &= planner._clock_text(s["at"]) in rest["tables"]   # a real table slot
+    check("planner: every plan has no overlaps, stays in the window, books real table slots", bool(plans) and ok)
+    best = plans[0]["stops"]
+    check("planner: a show that would end after the window closes is never planned",
+          not any(s["obj"].get("time") in ("10:20 PM", "9:00 PM") for p in plans for s in p["stops"]))
+    check("planner: the 6:30 show, then the first table after it ends plus travel (10:00 PM)",
+          [(s["kind"], planner._clock_text(s["at"])) for s in best] == [("movie", "6:30 PM"), ("meal", "10:00 PM")])
+    check("planner: the bill is tickets plus dinner after the offer", plans[0]["cost"] == 330 * 2 + 1280)
+    tight = planner.schedule({**req, "budget": 2000}, shows, [rest], [])
+    check("planner: nothing over budget", tight and all(p["cost"] <= 2000 for p in tight))
+    check("planner: an impossible budget gives no plan", planner.schedule({**req, "budget": 300}, shows, [rest], []) == [])
+
+    garden = {"name": "NTR Gardens", "kind": "see", "district": "Central", "hours": "2-8:30PM", "price": "₹20",
+              "open_close": (14 * 60, 20 * 60 + 30), "lat": None, "lon": None}
+    sight_req = planner.read_request("hyderabad", "plan our evening for 2 with some sightseeing and dinner, no movie", afternoon)
+    sp = planner.schedule(sight_req, shows, [rest], [garden])[0]["stops"]
+    check("planner: asked-for sightseeing comes first, dinner at a later table after it",
+          [s["kind"] for s in sp] == ["visit", "meal"] and sp[0]["at"] + sp[0]["len"] <= sp[1]["at"]
+          and sp[0]["at"] + sp[0]["len"] <= garden["open_close"][1] and sp[0]["cost"] == 40)
+
+    out = planner.render(req, planner.pick(plans), "hyderabad")
+    check("planner: the plan carries a show card and the table link",
+          "[[show|Ramayana|INOX GVK One, Banjara Hills Hyderabad|6:30 PM|-|Rs330-385]]" in out and rest["url"] in out)
+
+    real = (dining.restaurants, places.near)
+    try:
+        dining.restaurants, places.near = (lambda city, area=None: [rest]), (lambda city, area: [])
+        check("planner: asks for the group size first", planner.respond("hyderabad", "plan my evening", [], listings, afternoon) == planner.PEOPLE_Q)
+        hist = [{"role": "user", "parts": [{"text": "plan my evening near banjara hills"}]},
+                {"role": "model", "parts": [{"text": planner.PEOPLE_Q}]}]
+        reply = planner.respond("hyderabad", "2", hist, listings, afternoon)
+        check("planner: the answer to the question picks the original request back up", reply.startswith("**Plan for 2 · Banjara Hills"))
+        check("planner: later days are declined honestly",
+              "only plan today" in planner.respond("hyderabad", "plan our weekend for 2", [], listings, afternoon))
+    finally:
+        dining.restaurants, places.near = real
+
+    check("places: opening hours", [places.parse_hours(t) for t in ["11AM-8PM", "2-8:30PM", "9-5PM", "24 hours daily", "daily"]]
+          == [(660, 1200), (840, 1230), (540, 1020), (0, 1440), None])
+    wiki = "{{see\n| name=[[Charminar]] | lat=17.36 | long=78.47\n| hours=9AM–5PM | price=₹25 | content=Built in {{IATA|X}} 1591.\n}}{{eat|name=Skip me}}"
+    check("places: Wikivoyage listings, nested templates and links handled",
+          places.parse_listings(wiki, "Old City") == [{"name": "Charminar", "kind": "see", "district": "Old City",
+                                                       "hours": "9AM–5PM", "price": "₹25", "lat": 17.36, "lon": 78.47}])
 
 
 def main():
@@ -1017,6 +1145,8 @@ def main():
     print("district_showtimes"); test_district_showtimes(install)
     print("district_catalog"); test_district_catalog(install)
     print("district later days"); test_district_future(install)
+    print("dining"); test_dining(install)
+    print("planner"); test_planner()
     print("bms_events (single-event regex fallback)"); test_bms_events_single_event_fallback(install)
     print("bms_seat_url"); test_bms_seat_url(install)
     print("district deep link"); test_district_seat_url(install)

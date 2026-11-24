@@ -22,6 +22,8 @@ from pathlib import Path
 
 import agent
 import booktic
+import dining
+import planner
 import prefs
 import ratelimit
 
@@ -243,6 +245,8 @@ class Handler(BaseHTTPRequestHandler):
             # Only pay for the later dates when the turn is actually about them
             ahead = booktic.needs_future(question, history)
             listings = booktic.crawl(city, ahead)  # raises ValueError for an unknown city
+            # food questions also get District's dine-in listings (never raises)
+            listings += dining.for_question(city, question)
         except (json.JSONDecodeError, ValueError) as e:
             return self._json(400, {"error": str(e)})
         except RuntimeError:  # crawl() is the only thing above that reaches the network
@@ -274,6 +278,16 @@ class Handler(BaseHTTPRequestHandler):
                                ("CF-Ray", "CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"))
         action = {}
         try:
+            # A day plan is computed, not generated: times, tables and money are worked
+            # out in planner.py, and its reply needs no model call at all.
+            if planner.wants_plan(question, history):
+                answer = planner.respond(city, question, history, listings)
+                history += [{"role": "user", "parts": [{"text": question}]},
+                            {"role": "model", "parts": [{"text": answer}]}]
+                send(type="token", text=answer)
+                send(type="done", answer=answer, history=history, booked=False, url=None,
+                     crawled=booktic.crawled_at(city))
+                return
             answer, booked, url = agent.handle(
                 question, history, listings, city,
                 on_token=lambda t: send(type="token", text=t),
