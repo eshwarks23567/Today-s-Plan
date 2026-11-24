@@ -550,10 +550,12 @@ def test_fetch_retries_challenges():
     import subprocess
     challenge = "<html><head><title>Just a moment...</title></head><body>x</body></html>"
     real = "<html><head><title>Hyderabad Movie Tickets</title></head></html>"
+    blocked = "<html><head><title>Attention Required! | Cloudflare</title></head></html>403"
 
     class Result:
         def __init__(self, out):
-            self.returncode, self.stdout, self.stderr = 0, out, ""
+            # fetch passes -w %{http_code}; default to 200 unless the case brings its own
+            self.returncode, self.stdout, self.stderr = 0, out if out[-3:].isdigit() else out + "200", ""
 
     calls = []
     queue = [challenge, challenge, real]
@@ -577,6 +579,16 @@ def test_fetch_retries_challenges():
         queue[:] = [real, real, real]
         REAL_FETCH("https://in.bookmyshow.com/x")
         check("a good page costs exactly one request", len(calls) == 1)
+
+        # a 403 block page without the challenge title was once returned as a page
+        # with no movies and blamed on a layout change (Render, Nov 2026)
+        calls.clear()
+        queue[:] = [blocked, blocked, blocked]
+        try:
+            REAL_FETCH("https://in.bookmyshow.com/x")
+            check("fetch raises on a non-2xx status", False)
+        except RuntimeError as e:
+            check("fetch raises on a non-2xx status", "HTTP 403" in str(e))
     finally:
         booktic.subprocess.run = real_run
         booktic.time.sleep = real_sleep

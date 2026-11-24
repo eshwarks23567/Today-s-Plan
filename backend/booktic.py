@@ -42,15 +42,20 @@ def fetch(url: str, tries: int = 3) -> str:
     for attempt in range(tries):
         r = subprocess.run(
             ["curl", "-s", "-L", "--proto", "=https", "--proto-redir", "=https",
-             "--max-time", "30", "-A", UA, url],
+             "--max-time", "30", "-A", UA, "-w", "%{http_code}", url],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
-        if r.returncode != 0 or not r.stdout:
+        # -w appends the 3-digit status: without it a 403 block page came back as a
+        # "page" with no movies in it and got blamed on a layout change
+        body, status = r.stdout[:-3], r.stdout[-3:]
+        if r.returncode != 0 or not body:
             problem = f"exit {r.returncode}"
-        elif _CHALLENGE.search(r.stdout[:2000]):
-            problem = "got a Cloudflare interstitial"
+        elif _CHALLENGE.search(body[:2000]):
+            problem = f"got a Cloudflare interstitial (HTTP {status})"
+        elif not status.startswith("2"):
+            problem = f"HTTP {status}"
         else:
-            return r.stdout
+            return body
         if attempt < tries - 1:
             time.sleep(1.0 + attempt)  # a challenge usually clears on the next try
     raise RuntimeError(f"fetch failed ({problem}) after {tries} tries: {url}")
@@ -509,11 +514,21 @@ def _bms_day(city: str, movies: list[dict], offset: int, pool) -> list[str]:
 def _build_today(city: str) -> str:
     """Everything that actually moves during a day: today's shows, both sources, events."""
     today_iso = date.today().isoformat()
-    bms_movies = itemlist(fetch(f"https://in.bookmyshow.com/explore/movies-{city}"))
     dcity = DISTRICT_CITY.get(city, city)
-    district_movies = itemlist(fetch(f"https://www.district.in/movies/?city={dcity}"))
+    why = {}
+    def catalog(name, url):  # one blocked source shouldn't take the other down with it
+        try:
+            movies = itemlist(fetch(url))
+            why[name] = f"{len(movies)} movies"
+            return movies
+        except RuntimeError as e:
+            why[name] = str(e)
+            print(f"  {name} catalog failed: {e}", file=sys.stderr)
+            return []
+    bms_movies = catalog("BMS", f"https://in.bookmyshow.com/explore/movies-{city}")
+    district_movies = catalog("District", f"https://www.district.in/movies/?city={dcity}")
     if not bms_movies and not district_movies:
-        raise RuntimeError("both sources returned no movies (layout changed or network down)")
+        raise RuntimeError(f"both sources returned no movies: {why}")
 
     lines = [f"Movie showtimes in {city}, crawled at {datetime.now():%H:%M} (today refreshes "
              f"every ~20 min, later dates hourly). Each section is labelled with its own date (see "
